@@ -117,7 +117,6 @@ class Settings(BaseSettings):
     ai_report_timeout_seconds: float = 5.0
     ai_conflict_timeout_seconds: float = 10.0
     ai_brief_timeout_seconds: float = 15.0
-    ai_prompt_version: str = "p0-v1"
     enable_legacy_demo_ai: bool = False
 
     max_image_bytes: int = 10 * 1024 * 1024

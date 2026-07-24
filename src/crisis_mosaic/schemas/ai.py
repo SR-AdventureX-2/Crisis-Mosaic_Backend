@@ -3,7 +3,35 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+RiskTag = Literal[
+    "trapped_people",
+    "missing_people",
+    "injured_people",
+    "severe_bleeding",
+    "unconscious_person",
+    "breathing_difficulty",
+    "elderly",
+    "child",
+    "pregnant_person",
+    "disabled_person",
+    "rising_water",
+    "rapid_current",
+    "deep_flooding",
+    "building_collapse",
+    "landslide",
+    "fire",
+    "electric_hazard",
+    "gas_leak",
+    "road_blocked",
+    "bridge_damage",
+    "medical_shortage",
+    "drinking_water_shortage",
+    "food_shortage",
+    "unsafe_shelter",
+    "communication_outage",
+]
 
 
 class ReportRefinementRequest(BaseModel):
@@ -24,7 +52,7 @@ class ReportRefinementRequest(BaseModel):
 
     incident_id: str
     category: Literal["rescue", "medical", "water", "food", "shelter", "road"]
-    content: str = Field(min_length=1, max_length=4000)
+    content: str = Field(min_length=1, max_length=300)
     location_text: str = Field(min_length=1, max_length=300)
 
 
@@ -34,8 +62,18 @@ class ReportRefinementOutput(BaseModel):
     refined_content: str = Field(min_length=1, max_length=5000)
     risk_hint: str = Field(max_length=1000)
     suggest_urgent: bool
-    detected_risk_tags: list[str] = Field(max_length=20)
+    detected_risk_tags: list[RiskTag] = Field(
+        max_length=20,
+        json_schema_extra={"uniqueItems": True},
+    )
     confidence: float = Field(ge=0, le=1)
+
+    @field_validator("detected_risk_tags")
+    @classmethod
+    def validate_unique_risk_tags(cls, value: list[RiskTag]) -> list[RiskTag]:
+        if len(value) != len(set(value)):
+            raise ValueError("detected_risk_tags must be unique")
+        return value
 
 
 class ReportRefinementResponse(ReportRefinementOutput):
@@ -67,6 +105,40 @@ class AttachmentEnrichmentOutput(BaseModel):
 
     ocr_text: str = Field(max_length=10000)
     vision_summary: str = Field(min_length=1, max_length=3000)
+
+
+class MediaOcrItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    frame_ref: str
+    text: str
+    confidence: float = Field(ge=0, le=1)
+
+
+class MediaObservation(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    frame_ref: str
+    time_offset_seconds: float | None = Field(default=None, ge=0)
+    fact: str = Field(min_length=1)
+    confidence: float = Field(ge=0, le=1)
+
+
+class MediaEvidenceExtractionOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    evidence_id: str = Field(min_length=1)
+    read_status: Literal["readable", "partially_readable", "unreadable"]
+    modality: Literal["image", "video"]
+    ocr_items: list[MediaOcrItem] = Field(max_length=50)
+    observations: list[MediaObservation] = Field(max_length=50)
+    location_clues: list[str] = Field(max_length=20)
+    time_clues: list[str] = Field(max_length=20)
+    risk_signals: list[str] = Field(max_length=20)
+    manipulation_signals: list[str] = Field(max_length=20)
+    summary: str = Field(max_length=2000)
+    limitations: list[str] = Field(max_length=20)
+    confidence: float = Field(ge=0, le=1)
 
 
 class ConflictProcessingOptions(BaseModel):
@@ -147,39 +219,56 @@ class ConflictAnalysisOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     recommended_evidence_id: str
-    suggested_conclusion: str = Field(min_length=1, max_length=4000)
-    reasoning_summary: str = Field(min_length=1, max_length=4000)
+    suggested_conclusion: str = Field(min_length=1, max_length=1000)
+    reasoning_summary: str = Field(min_length=1, max_length=2000)
     confidence: float = Field(ge=0, le=1)
-    evidence_assessments: list[EvidenceAssessment] = Field(min_length=1)
-    warnings: list[str] = Field(default_factory=list, max_length=20)
+    evidence_assessments: list[EvidenceAssessment] = Field(min_length=1, max_length=500)
+    warnings: list[str] = Field(default_factory=list, max_length=30)
 
     def validate_evidence_refs(self, allowed: set[str]) -> None:
         assessment_ids = [item.evidence_id for item in self.evidence_assessments]
         if len(assessment_ids) != len(set(assessment_ids)):
             raise ValueError("AI output contains duplicate evidence assessments")
         referenced = set(assessment_ids)
-        unknown = sorted((referenced | {self.recommended_evidence_id}) - allowed)
+        recommended = {self.recommended_evidence_id} if self.recommended_evidence_id else set()
+        unknown = sorted((referenced | recommended) - allowed)
         if unknown:
             raise ValueError(f"AI output referenced unknown evidence: {unknown}")
         missing = sorted(allowed - referenced)
         if missing:
             raise ValueError(f"AI output omitted evidence assessments: {missing}")
+        if not any(
+            "AI 只提供辅助判断" in warning and "指挥人员确认" in warning
+            for warning in self.warnings
+        ):
+            raise ValueError("AI output omitted human confirmation warning")
 
 
 class BriefRecommendation(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    text: str = Field(min_length=1, max_length=2000)
+    text: str = Field(min_length=1, max_length=500)
     severity: Literal["low", "medium", "high"]
-    source_refs: list[str] = Field(min_length=1, max_length=30)
+    source_refs: list[str] = Field(
+        min_length=1,
+        max_length=20,
+        json_schema_extra={"uniqueItems": True},
+    )
+
+    @field_validator("source_refs")
+    @classmethod
+    def validate_unique_source_refs(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("source_refs must be unique")
+        return value
 
 
 class CommandBriefOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    headline: str = Field(min_length=1, max_length=300)
-    summary: str = Field(min_length=1, max_length=5000)
-    recommendations: list[BriefRecommendation] = Field(max_length=50)
+    headline: str = Field(min_length=1, max_length=100)
+    summary: str = Field(min_length=1, max_length=1000)
+    recommendations: list[BriefRecommendation] = Field(max_length=10)
     confidence: float = Field(ge=0, le=1)
 
     def validate_source_refs(self, allowed: set[str]) -> None:
@@ -290,7 +379,12 @@ class AnalysisStatusResponse(BaseModel):
     model_provider: str | None
     model_name: str | None
     prompt_version: str
+    prompt_sha256: str | None = None
     latency_ms: int | None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    schema_valid: bool | None = None
+    reference_valid: bool | None = None
     error_code: str | None
     error_message: str | None
     input_version: int

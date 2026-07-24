@@ -80,6 +80,10 @@ Invoke-RestMethod http://127.0.0.1:8000/api/v1/health/ready
 `ready` 将分别报告数据库、图片扫描器和 AI。AI 未配置属于降级状态；数据库不可用会返回
 503。扫描器不可用时图片处理失败关闭。
 
+AI 提示词版本固定在代码中，运行时配置只选择模型、超时、JSON Schema 支持能力和
+provider。分析状态接口会返回 `prompt_sha256`、token 用量、Schema 校验状态和引用校验
+状态，便于审计同一模型在不同版本提示词下的输出。
+
 ## Windows Defender
 
 如果 `MpCmdRun.exe` 不在 PATH，设置：

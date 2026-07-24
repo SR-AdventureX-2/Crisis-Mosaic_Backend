@@ -2,8 +2,8 @@
 
 ## 定位
 
-本仓库实现 `backend.md` 的业务闭环，但部署边界固定为单机 SQLite。产品 AI 展示仍由
-独立 Flutter 前端负责；Swagger UI 只用于 API 文档、鉴权和 AI 调试。
+本仓库按 V1.1 合并需求实现单机功能型 P0 业务闭环，但部署边界固定为单机 SQLite。
+产品 AI 展示仍由独立 Flutter 前端负责；Swagger UI 只用于 API 文档、鉴权和 AI 调试。
 
 `backend.md` 保持原文不改，本文件记录实现时锁定的覆盖项和偏差。
 
@@ -43,8 +43,9 @@
   API 不代理新媒体文件字节，也不下发 AK/SK。视频仍由 `ENABLE_VIDEO_UPLOAD` 控制。
 - 指挥端 Push 使用设备注册、个人偏好、通知 Outbox、Mock provider 投递和回执记录；
   业务事务不直接调用第三方服务。
-- AI 上报整理同步执行；正式冲突分析和态势简报异步执行。AI 输出必须通过 Schema 和
-  证据引用校验。
+- AI 上报整理同步执行；正式冲突分析和态势简报异步执行。AI 输出必须通过 Schema、
+  证据/source_ref 引用校验和事实保护校验；分析记录保存 prompt 版本、`prompt_sha256`、
+  token 用量和校验状态。
 - 上报创建的幂等记录与业务数据原子提交。其他写接口使用独立的持久幂等 reservation；
   极端进程崩溃发生在业务提交与响应快照提交之间时，会保留 `IN_PROGRESS` 到 24 小时
   窗口结束，而不是猜测结果并自动重放写操作。

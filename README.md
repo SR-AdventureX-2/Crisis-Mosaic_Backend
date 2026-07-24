@@ -195,7 +195,16 @@ AI_BRIEF_MODEL=gpt-4.1-mini
 ```
 
 测试和离线演示可设置 `AI_PROVIDER=fake`。服务端始终使用 Pydantic Schema 校验 AI
-输出，并校验证据 ID 白名单。AI 不能直接写入最终事实；事实变更只能经过人工冲突决策。
+输出，并校验证据 ID / source_ref 白名单、报告事实保护规则和简报 metrics 引用。AI 不能直接
+写入最终事实；事实变更只能经过人工冲突决策。
+
+提示词按任务在代码中固化，并分别记录版本和 `prompt_sha256`。当前版本为：
+`cm-report-refinement-v1.0.0`、`cm-media-evidence-extraction-v1.0.0`、
+`cm-conflict-analysis-v1.0.0`、`cm-command-brief-v1.0.0` 和
+`cm-json-repair-v1.0.0`。
+
+`GET /api/v1/ai/analyses/{analysis_id}` 会返回 `prompt_sha256`、`input_tokens`、
+`output_tokens`、`schema_valid` 和 `reference_valid`，用于审计结构化输出和引用校验。
 
 当前 Flutter 演示使用的 `context.evidence` 同步冲突请求仅在
 `ENABLE_LEGACY_DEMO_AI=true` 时启用。正式请求始终从数据库读取当前完整证据并返回

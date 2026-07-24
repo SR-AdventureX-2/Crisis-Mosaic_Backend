@@ -27,16 +27,28 @@ from crisis_mosaic.schemas.ai import (
     CommandBriefOutput,
     ConflictAnalysisOutput,
     EvidenceAssessment,
+    MediaEvidenceExtractionOutput,
+    MediaObservation,
+    MediaOcrItem,
+    ReportRefinementOutput,
     ReportRefinementRequest,
 )
 from crisis_mosaic.schemas.uploads import ImageIntentRequest
 from crisis_mosaic.security import Actor
 from crisis_mosaic.services.ai import (
+    _media_evidence_to_attachment_output,
+    _validate_command_brief_contract,
+    _validate_media_evidence_contract,
+    _validate_report_refinement_contract,
     build_conflict_context,
     enqueue_conflict_analysis,
     ensure_ai_available,
     process_analysis,
     refine_report,
+)
+from crisis_mosaic.services.ai_prompts import (
+    CONFLICT_ANALYSIS_PROMPT_VERSION,
+    REPORT_REFINEMENT_PROMPT_VERSION,
 )
 from crisis_mosaic.services.uploads import (
     attachment_state,
@@ -67,6 +79,68 @@ def test_upload_intent_rejects_path_traversal() -> None:
             size_bytes=4,
             sha256="0" * 64,
         )
+
+
+def test_report_refinement_rejects_added_numbers() -> None:
+    request = ReportRefinementRequest(
+        incident_id="incident",
+        category="rescue",
+        content="水位上涨，有2人被困",
+        location_text="东桥",
+    )
+    output = ReportRefinementOutput(
+        refined_content="【需要救援】水位上涨，有2人被困，另有5人等待转移。\n【位置】东桥",
+        risk_hint="检测到明确风险，建议居民确认紧急标记并尽快提交。",
+        suggest_urgent=True,
+        detected_risk_tags=["trapped_people", "rising_water"],
+        confidence=0.8,
+    )
+
+    with pytest.raises(ApiError) as error:
+        _validate_report_refinement_contract(request, output)
+    assert error.value.code == "AI_OUTPUT_FACT_INTEGRITY_FAILED"
+
+
+def test_media_evidence_output_maps_to_attachment_fields() -> None:
+    attachment = Attachment(
+        id="01900000-0000-7000-8000-000000000101",
+        incident_id="incident",
+        uploader_device_id="device",
+        file_name="scene.jpg",
+        declared_mime_type="image/jpeg",
+        size_bytes=100,
+        expected_sha256="0" * 64,
+        media_type="image",
+        upload_expires_at=utcnow(),
+    )
+    output = MediaEvidenceExtractionOutput(
+        evidence_id=attachment.id,
+        read_status="partially_readable",
+        modality="image",
+        ocr_items=[MediaOcrItem(frame_ref="image", text="水深约2米", confidence=0.7)],
+        observations=[
+            MediaObservation(
+                frame_ref="image",
+                time_offset_seconds=None,
+                fact="画面可见道路积水",
+                confidence=0.8,
+            )
+        ],
+        location_clues=["东桥"],
+        time_clues=["傍晚"],
+        risk_signals=["道路积水"],
+        manipulation_signals=["局部低清晰度"],
+        summary="画面显示道路积水，部分文字可读。",
+        limitations=["无法判断水流速度"],
+        confidence=0.72,
+    )
+
+    _validate_media_evidence_contract(attachment, output)
+    folded = _media_evidence_to_attachment_output(output)
+
+    assert folded.ocr_text == "水深约2米"
+    assert "画面观察" in folded.vision_summary
+    assert "局部低清晰度" in folded.vision_summary
 
 
 @pytest.mark.asyncio
@@ -216,6 +290,47 @@ def test_conflict_ai_output_must_assess_every_evidence_once() -> None:
         output.validate_evidence_refs({"evidence-1", "evidence-2"})
 
 
+def test_conflict_ai_output_allows_no_recommendation_with_human_warning() -> None:
+    output = ConflictAnalysisOutput(
+        recommended_evidence_id="",
+        suggested_conclusion="现有证据不足，无法形成可靠结论，建议人工复核。",
+        reasoning_summary="所有证据都缺少可核验上下文。",
+        confidence=0.2,
+        evidence_assessments=[
+            EvidenceAssessment(
+                evidence_id="evidence-1",
+                authenticity_score=0.5,
+                credibility_score=0.2,
+                verdict="uncertain",
+                reason="缺少观察时间，无法可靠判断当前状态。",
+                extracted_facts=[],
+            )
+        ],
+        warnings=["AI 只提供辅助判断，最终结论必须由指挥人员确认。"],
+    )
+
+    output.validate_evidence_refs({"evidence-1"})
+
+
+def test_report_refinement_rejects_unknown_or_duplicate_risk_tags() -> None:
+    with pytest.raises(ValidationError):
+        ReportRefinementOutput(
+            refined_content="【需要救援】桥边有人被困。\n【位置】大关桥",
+            risk_hint="检测到明确风险。",
+            suggest_urgent=True,
+            detected_risk_tags=["injury"],
+            confidence=0.8,
+        )
+    with pytest.raises(ValidationError):
+        ReportRefinementOutput(
+            refined_content="【需要救援】桥边有人被困。\n【位置】大关桥",
+            risk_hint="检测到明确风险。",
+            suggest_urgent=True,
+            detected_risk_tags=["trapped_people", "trapped_people"],
+            confidence=0.8,
+        )
+
+
 def test_command_brief_rejects_source_refs_outside_snapshot_whitelist() -> None:
     output = CommandBriefOutput(
         headline="Current incident brief",
@@ -232,6 +347,45 @@ def test_command_brief_rejects_source_refs_outside_snapshot_whitelist() -> None:
 
     with pytest.raises(ValueError, match="unknown sources"):
         output.validate_source_refs({"incident:current", "report:known"})
+
+
+def test_command_brief_summary_numbers_must_come_from_metrics() -> None:
+    snapshot = {
+        "metrics": {
+            "active_report_count": 28,
+            "urgent_report_count": 4,
+            "open_conflict_count": 2,
+            "open_blind_spot_count": 3,
+        }
+    }
+    output = CommandBriefOutput(
+        headline="人员救援与道路通行仍存在关键风险",
+        summary="当前共有 28 条有效上报，其中 4 条标记紧急；另有 2 个未解决冲突。",
+        recommendations=[
+            BriefRecommendation(
+                text="优先人工复核大关桥上报。",
+                severity="high",
+                source_refs=["report:known"],
+            )
+        ],
+        confidence=0.6,
+    )
+    _validate_command_brief_contract(snapshot, output)
+
+    invalid = CommandBriefOutput(
+        headline="人员救援与道路通行仍存在关键风险",
+        summary="当前共有 29 条有效上报，其中 4 条标记紧急。",
+        recommendations=[
+            BriefRecommendation(
+                text="优先人工复核大关桥上报。",
+                severity="high",
+                source_refs=["report:known"],
+            )
+        ],
+        confidence=0.6,
+    )
+    with pytest.raises(ApiError, match="metrics"):
+        _validate_command_brief_contract(snapshot, invalid)
 
 
 @pytest.mark.asyncio
@@ -269,7 +423,12 @@ async def test_fake_report_refinement_is_persisted(tmp_path: Path) -> None:
         await session.commit()
         saved = await session.get(AiAnalysis, analysis.id)
         assert saved is not None and saved.status == "succeeded"
+        assert saved.prompt_version == REPORT_REFINEMENT_PROMPT_VERSION
+        assert saved.prompt_sha256 is not None and len(saved.prompt_sha256) == 64
+        assert saved.schema_valid is True
+        assert saved.reference_valid is True
         assert result.suggest_urgent is True
+        assert result.refined_content.startswith("【需要救援】")
         assert "elderly" in result.detected_risk_tags
     await engine.dispose()
 
@@ -311,7 +470,7 @@ async def test_async_analysis_missing_key_persists_failure_and_reopens_conflict(
                 "allowed_evidence_ids": ["evidence"],
             },
             context_package={"evidence": []},
-            prompt_version="p0-v1",
+            prompt_version=CONFLICT_ANALYSIS_PROMPT_VERSION,
             created_by_type="account",
             created_by_id="operator",
             input_version=conflict.revision,

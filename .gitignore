@@ -49,6 +49,14 @@ coverage.xml
 *.py.cover
 .hypothesis/
 .pytest_cache/
+.tmp/
+.test-tmp/
+pytest_tmp_run_*/
+pytest-cache-files-*/
+pytest_verify_*/
+pytest_verify_escalated_*/
+pytest_full_escalated_*/
+alembic_verify*.db
 cover/
 
 # Translations

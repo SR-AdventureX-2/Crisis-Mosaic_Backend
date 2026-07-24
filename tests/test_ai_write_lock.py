@@ -23,6 +23,7 @@ from crisis_mosaic.models import (
 from crisis_mosaic.schemas.ai import ReportRefinementRequest
 from crisis_mosaic.security import Actor
 from crisis_mosaic.services import ai as ai_service
+from crisis_mosaic.services.ai_prompts import COMMAND_BRIEF_PROMPT_VERSION
 
 
 class LockCheckingSession:
@@ -235,9 +236,23 @@ async def test_canonical_worker_completion_keeps_model_call_outside_write_lock(
             incident_id=incident.id,
             analysis_type="command_brief",
             status="queued",
-            input_snapshot={"counts": {}},
-            context_package={"counts": {}},
-            prompt_version="p0-v1",
+            input_snapshot={
+                "metrics": {
+                    "active_report_count": 0,
+                    "urgent_report_count": 0,
+                    "open_conflict_count": 0,
+                    "open_blind_spot_count": 0,
+                }
+            },
+            context_package={
+                "metrics": {
+                    "active_report_count": 0,
+                    "urgent_report_count": 0,
+                    "open_conflict_count": 0,
+                    "open_blind_spot_count": 0,
+                }
+            },
+            prompt_version=COMMAND_BRIEF_PROMPT_VERSION,
             created_by_type="account",
             created_by_id="operator",
             input_version=0,
