@@ -96,6 +96,35 @@ class AnonymousDevice(Base, IdMixin):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class ReporterContact(Base, IdMixin, TimestampMixin):
+    __tablename__ = "reporter_contacts"
+
+    incident_id: Mapped[str] = mapped_column(ForeignKey("incidents.id"), index=True)
+    resident_device_id: Mapped[str] = mapped_column(
+        ForeignKey("anonymous_devices.id"), index=True
+    )
+    full_name_ciphertext: Mapped[str] = mapped_column(Text)
+    full_name_masked: Mapped[str] = mapped_column(String(100))
+    mobile_ciphertext: Mapped[str] = mapped_column(Text)
+    mobile_blind_index: Mapped[str] = mapped_column(String(64), index=True)
+    mobile_masked: Mapped[str] = mapped_column(String(32))
+    national_id_ciphertext: Mapped[str | None] = mapped_column(Text)
+    national_id_blind_index: Mapped[str | None] = mapped_column(String(64), index=True)
+    national_id_masked: Mapped[str | None] = mapped_column(String(32))
+    emergency_name_ciphertext: Mapped[str | None] = mapped_column(Text)
+    emergency_name_masked: Mapped[str | None] = mapped_column(String(100))
+    emergency_mobile_ciphertext: Mapped[str | None] = mapped_column(Text)
+    emergency_mobile_masked: Mapped[str | None] = mapped_column(String(32))
+    emergency_relation_ciphertext: Mapped[str | None] = mapped_column(Text)
+    emergency_relation_masked: Mapped[str | None] = mapped_column(String(100))
+    rescue_notes_ciphertext: Mapped[str | None] = mapped_column(Text)
+    encryption_key_version: Mapped[str] = mapped_column(String(40))
+    consent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    retention_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    legal_hold: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    anonymized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class RefreshSession(Base, IdMixin):
     __tablename__ = "refresh_sessions"
 
@@ -117,6 +146,9 @@ class Report(Base, IdMixin, TimestampMixin):
 
     incident_id: Mapped[str] = mapped_column(ForeignKey("incidents.id"), index=True)
     reporter_device_id: Mapped[str] = mapped_column(ForeignKey("anonymous_devices.id"), index=True)
+    reporter_contact_id: Mapped[str | None] = mapped_column(
+        ForeignKey("reporter_contacts.id"), index=True
+    )
     category: Mapped[str] = mapped_column(String(20), index=True)
     content_original: Mapped[str] = mapped_column(Text)
     content_display: Mapped[str] = mapped_column(Text)
@@ -176,6 +208,12 @@ class Attachment(Base, IdMixin):
     uploader_device_id: Mapped[str] = mapped_column(ForeignKey("anonymous_devices.id"))
     file_name: Mapped[str] = mapped_column(String(255))
     declared_mime_type: Mapped[str] = mapped_column(String(80))
+    media_type: Mapped[str] = mapped_column(String(20), default="image", index=True)
+    client_source: Mapped[str | None] = mapped_column(String(20))
+    storage_provider: Mapped[str] = mapped_column(String(40), default="local_proxy", index=True)
+    bucket: Mapped[str | None] = mapped_column(String(120))
+    object_key: Mapped[str | None] = mapped_column(String(500), index=True)
+    etag: Mapped[str | None] = mapped_column(String(120))
     mime_type: Mapped[str | None] = mapped_column(String(80))
     size_bytes: Mapped[int] = mapped_column(Integer)
     expected_sha256: Mapped[str] = mapped_column(String(64))
@@ -188,6 +226,15 @@ class Attachment(Base, IdMixin):
     thumbnail_path: Mapped[str | None] = mapped_column(String(500))
     width: Mapped[int | None] = mapped_column(Integer)
     height: Mapped[int | None] = mapped_column(Integer)
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    cover_path: Mapped[str | None] = mapped_column(String(500))
+    preview_path: Mapped[str | None] = mapped_column(String(500))
+    transcript_status: Mapped[str | None] = mapped_column(String(20))
+    transcript_text: Mapped[str | None] = mapped_column(Text)
+    transcode_status: Mapped[str | None] = mapped_column(String(20))
+    keyframe_status: Mapped[str | None] = mapped_column(String(20))
+    processing_progress: Mapped[int] = mapped_column(Integer, default=0)
+    policy_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     exif_data: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     metadata_status: Mapped[str] = mapped_column(String(20), default="pending")
@@ -200,6 +247,46 @@ class Attachment(Base, IdMixin):
     upload_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class MediaUploadSession(Base, IdMixin, TimestampMixin):
+    __tablename__ = "media_upload_sessions"
+    __table_args__ = (UniqueConstraint("attachment_id", "client_checkpoint_id"),)
+
+    attachment_id: Mapped[str] = mapped_column(
+        ForeignKey("report_attachments.id", ondelete="CASCADE"), index=True
+    )
+    resident_device_id: Mapped[str] = mapped_column(ForeignKey("anonymous_devices.id"), index=True)
+    provider: Mapped[str] = mapped_column(String(40), default="qiniu_kodo_mock")
+    mode: Mapped[str] = mapped_column(String(20), default="resumable")
+    object_key: Mapped[str] = mapped_column(String(500), index=True)
+    upload_token_fingerprint: Mapped[str] = mapped_column(String(16))
+    token_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    chunk_size_bytes: Mapped[int] = mapped_column(Integer)
+    max_parallel_uploads: Mapped[int] = mapped_column(Integer)
+    expected_size_bytes: Mapped[int] = mapped_column(Integer)
+    expected_sha256: Mapped[str] = mapped_column(String(64))
+    confirmed_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    client_checkpoint_id: Mapped[str | None] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    policy_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    aborted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MediaUploadPart(Base, IdMixin, TimestampMixin):
+    __tablename__ = "media_upload_parts"
+    __table_args__ = (UniqueConstraint("upload_session_id", "part_number"),)
+
+    upload_session_id: Mapped[str] = mapped_column(
+        ForeignKey("media_upload_sessions.id", ondelete="CASCADE"), index=True
+    )
+    part_number: Mapped[int] = mapped_column(Integer)
+    offset: Mapped[int] = mapped_column(Integer)
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    etag: Mapped[str] = mapped_column(String(120))
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), default="confirmed")
 
 
 class BlindSpot(Base, IdMixin, TimestampMixin):
@@ -478,6 +565,104 @@ class OutboxEvent(Base, IdMixin):
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     publish_attempts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class PushDevice(Base, IdMixin, TimestampMixin):
+    __tablename__ = "push_devices"
+    __table_args__ = (
+        UniqueConstraint("operator_id", "provider", "provider_token_hash"),
+        UniqueConstraint("operator_id", "installation_id_hash", "provider"),
+    )
+
+    operator_id: Mapped[str] = mapped_column(ForeignKey("local_accounts.id"), index=True)
+    installation_id_hash: Mapped[str] = mapped_column(String(64), index=True)
+    platform: Mapped[str] = mapped_column(String(20), index=True)
+    provider: Mapped[str] = mapped_column(String(40), index=True)
+    provider_token_ciphertext: Mapped[str] = mapped_column(Text)
+    provider_token_hash: Mapped[str] = mapped_column(String(64), index=True)
+    token_fingerprint: Mapped[str] = mapped_column(String(16))
+    app_id: Mapped[str] = mapped_column(String(160))
+    environment: Mapped[str] = mapped_column(String(20), default="dev")
+    authorization_status: Mapped[str] = mapped_column(String(30), default="authorized")
+    route_priority: Mapped[int] = mapped_column(Integer, default=1)
+    app_version: Mapped[str | None] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    revoked_reason: Mapped[str | None] = mapped_column(String(120))
+
+
+class NotificationPreference(Base, IdMixin, TimestampMixin):
+    __tablename__ = "notification_preferences"
+    __table_args__ = (UniqueConstraint("operator_id", "incident_id"),)
+
+    operator_id: Mapped[str] = mapped_column(ForeignKey("local_accounts.id"), index=True)
+    incident_id: Mapped[str] = mapped_column(ForeignKey("incidents.id"), index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    minimum_priority: Mapped[str] = mapped_column(String(12), default="high")
+    event_types: Mapped[list[str]] = mapped_column(JSON, default=list)
+    quiet_hours: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class NotificationOutbox(Base, IdMixin, TimestampMixin):
+    __tablename__ = "notification_outbox"
+    __table_args__ = (UniqueConstraint("dedupe_key", "recipient_operator_id"),)
+
+    incident_id: Mapped[str] = mapped_column(ForeignKey("incidents.id"), index=True)
+    recipient_operator_id: Mapped[str] = mapped_column(ForeignKey("local_accounts.id"), index=True)
+    business_event_id: Mapped[str] = mapped_column(String(36), index=True)
+    dedupe_key: Mapped[str] = mapped_column(String(160), index=True)
+    event_type: Mapped[str] = mapped_column(String(80), index=True)
+    priority: Mapped[str] = mapped_column(String(12), default="high", index=True)
+    resource_type: Mapped[str] = mapped_column(String(50))
+    resource_id: Mapped[str | None] = mapped_column(String(36))
+    resource_revision: Mapped[int | None] = mapped_column(Integer)
+    deep_link: Mapped[str | None] = mapped_column(String(300))
+    title: Mapped[str] = mapped_column(String(120))
+    body: Mapped[str] = mapped_column(String(240))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    run_after: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(String(80))
+
+
+class NotificationDelivery(Base, IdMixin, TimestampMixin):
+    __tablename__ = "notification_deliveries"
+    __table_args__ = (UniqueConstraint("notification_outbox_id", "push_device_id"),)
+
+    notification_outbox_id: Mapped[str] = mapped_column(
+        ForeignKey("notification_outbox.id", ondelete="CASCADE"), index=True
+    )
+    push_device_id: Mapped[str] = mapped_column(ForeignKey("push_devices.id"), index=True)
+    provider: Mapped[str] = mapped_column(String(40))
+    provider_message_id: Mapped[str | None] = mapped_column(String(160))
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    provider_response: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    clicked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class NotificationReceipt(Base, IdMixin, TimestampMixin):
+    __tablename__ = "notification_receipts"
+    __table_args__ = (
+        UniqueConstraint("notification_outbox_id", "receipt_type", "installation_id_hash"),
+    )
+
+    notification_outbox_id: Mapped[str] = mapped_column(
+        ForeignKey("notification_outbox.id", ondelete="CASCADE"), index=True
+    )
+    receipt_type: Mapped[str] = mapped_column(String(20), index=True)
+    installation_id_hash: Mapped[str] = mapped_column(String(64), index=True)
+    app_state: Mapped[str | None] = mapped_column(String(20))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class MapFeature(Base, IdMixin, TimestampMixin):

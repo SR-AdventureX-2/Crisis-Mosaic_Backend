@@ -6,8 +6,10 @@
 - 一个可写的本地数据目录。
 - Windows Defender `MpCmdRun.exe`，或测试环境明确使用 fake scanner。
 - OpenAI-compatible API Key（仅 AI 功能需要）。
+- 真实 Kodo、FCM/APNs 或厂商 Push 凭证仅在接入生产通道时需要；默认使用 Mock。
 
-不使用 Docker、Compose、Redis、Celery、PostGIS 或外部对象存储。
+不使用 Docker、Compose、Redis、Celery 或 PostGIS。默认媒体和 Push 使用 Mock，便于
+单机联调；真实对象存储和 Push provider 仍需要独立凭证、回调和验收。
 
 ## 安装与升级
 
@@ -40,11 +42,14 @@ Pydantic Settings 从进程环境和仓库根目录 `.env` 读取配置；进程
 - `JWT_SECRET`
 - `INSTALLATION_ID_PEPPER`
 - `UPLOAD_SIGNING_SECRET`
+- `PII_ENCRYPTION_KEY`
+- `PII_BLIND_INDEX_SECRET`
+- `PUSH_TOKEN_SECRET`
 - 两个 bootstrap 账号密码
 - `AI_API_KEY`（需要真实 AI 时）
 
 生产环境设置 `APP_ENV=production` 后，应用会拒绝模板占位值、过短或重复的签名密钥、
-明显弱的 bootstrap 密码以及通配 CORS。
+PII/Push 密钥、明显弱的 bootstrap 密码以及通配 CORS。
 
 数据库和文件目录可改为绝对路径：
 
@@ -86,6 +91,47 @@ DEFENDER_COMMAND=C:/Program Files/Windows Defender/MpCmdRun.exe
 
 常规自动化测试设置 `MALWARE_SCANNER=fake`。`disabled` 不表示跳过扫描，而是使图片处理
 返回不可用错误。
+
+## 媒体与 Kodo
+
+旧 `/uploads/image-intents` 仍走本地代理图片链路。新版 `/uploads/media-intents` 默认
+使用 `MEDIA_STORAGE_PROVIDER=qiniu_kodo_mock`，返回短期 Upload Token、对象 Key、
+上传 Host、策略快照和可恢复上传会话参数，文件字节不经过业务后端。
+
+真实七牛接入时至少配置：
+
+```dotenv
+MEDIA_STORAGE_PROVIDER=qiniu_kodo
+QINIU_ACCESS_KEY=...
+QINIU_SECRET_KEY=...
+QINIU_BUCKET=...
+QINIU_UPLOAD_HOST=https://...
+QINIU_PUBLIC_BASE_URL=https://...
+QINIU_CALLBACK_URL=https://...
+```
+
+`QINIU_SECRET_KEY` 只允许留在后端运行环境；不得写入客户端、日志或 API 响应。视频默认
+保持 `ENABLE_VIDEO_UPLOAD=false`，完成真实 Kodo 文件信息校验、扫描、转码和回调验收后
+再开启。
+
+## Push 通知
+
+指挥账号通过 `/api/v1/me/push-devices` 注册本 App 安装的 Push Token，通过
+`/api/v1/me/notification-preferences/{incident_id}` 维护偏好。业务事务只写
+`notification_outbox`；后台 worker 负责 Mock provider 投递和回执更新。
+
+默认配置：
+
+```dotenv
+PUSH_NOTIFICATIONS_ENABLED=true
+PUSH_PROVIDER_MODE=mock
+PUSH_ALLOWED_APP_IDS=["com.srstudio.advx2team.crisismosaic"]
+PUSH_ALLOWED_PROVIDERS=["fcm","apns","huawei","xiaomi","oppo","vivo","honor"]
+```
+
+真实 APNs、FCM 或厂商通道接入前，应补齐 provider 凭证、无效 Token 清理、错误码映射
+和 Payload 扫描。Push Payload 只能包含通知 ID、业务事件 ID、资源引用、修订号和允许
+scheme 的深链，不包含联系人、正文、精确地址、坐标、附件 URL 或认证 Token。
 
 ## 备份与恢复
 

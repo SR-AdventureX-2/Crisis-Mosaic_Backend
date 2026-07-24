@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import secrets
 import shutil
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -12,19 +13,21 @@ import filetype  # type: ignore[import-untyped]
 import imagehash
 from fastapi import UploadFile
 from PIL import Image, ImageOps, UnidentifiedImageError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings, get_settings
 from ..errors import ApiError
-from ..models import Attachment, BackgroundJob
-from ..utils import utcnow
+from ..models import Attachment, BackgroundJob, MediaUploadPart, MediaUploadSession
+from ..utils import sha256_text, utcnow
 
 ALLOWED_MIME_FORMATS = {
     "image/jpeg": "JPEG",
     "image/png": "PNG",
     "image/webp": "WEBP",
 }
+ALLOWED_IMAGE_MIME_TYPES = set(ALLOWED_MIME_FORMATS)
+ALLOWED_VIDEO_MIME_TYPES = {"video/mp4", "video/quicktime", "video/webm"}
 SAFE_EXIF_TAGS = {271: "make", 272: "model", 306: "datetime", 36867: "captured_at"}
 
 
@@ -38,7 +41,7 @@ def attachment_state(attachment: Attachment) -> str:
     if (
         attachment.metadata_status == "ready"
         and attachment.malware_scan_status == "clean"
-        and attachment.sanitized_path
+        and (attachment.sanitized_path or attachment.object_key)
     ):
         return "ready"
     if attachment.uploaded_at:
@@ -88,6 +91,411 @@ async def create_image_intent(
     )
     session.add(attachment)
     await session.flush()
+    return attachment
+
+
+def media_policy(settings: Settings | None = None) -> dict[str, int | str]:
+    settings = settings or get_settings()
+    return {
+        "version": settings.media_policy_version,
+        "max_file_size_bytes": settings.media_max_file_size_bytes,
+        "max_report_total_bytes": settings.media_max_report_total_bytes,
+        "max_attachment_count": settings.media_max_attachment_count,
+        "max_video_duration_ms": settings.media_max_video_duration_ms,
+        "max_parallel_uploads": settings.media_max_parallel_uploads,
+        "quota_remaining_bytes": settings.media_max_report_total_bytes,
+    }
+
+
+def _object_suffix(file_name: str, mime_type: str) -> str:
+    suffix = Path(file_name).suffix.lower()
+    if suffix and len(suffix) <= 12 and all(ch.isalnum() or ch == "." for ch in suffix):
+        return suffix
+    return {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "video/mp4": ".mp4",
+        "video/quicktime": ".mov",
+        "video/webm": ".webm",
+    }.get(mime_type, ".bin")
+
+
+def _upload_token(*, attachment_id: str, object_key: str, settings: Settings) -> tuple[str, str]:
+    token = secrets.token_urlsafe(48)
+    fingerprint = sha256_text(f"{attachment_id}:{object_key}:{token}")[-8:]
+    return token, fingerprint
+
+
+async def create_media_intent(
+    session: AsyncSession,
+    *,
+    incident_id: str,
+    uploader_device_id: str,
+    media_type: str,
+    client_source: str,
+    file_name: str,
+    mime_type: str,
+    size_bytes: int,
+    expected_sha256: str,
+    duration_ms: int | None,
+    resumable_upload: bool,
+    settings: Settings | None = None,
+) -> tuple[Attachment, dict[str, object], str]:
+    settings = settings or get_settings()
+    if media_type == "image" and mime_type not in ALLOWED_IMAGE_MIME_TYPES:
+        raise ApiError(415, "UNSUPPORTED_IMAGE_TYPE", "仅支持 JPEG、PNG 和 WebP")
+    if media_type == "video":
+        if not settings.enable_video_upload:
+            raise ApiError(501, "VIDEO_UPLOAD_DISABLED", "视频上传尚未开放")
+        if mime_type not in ALLOWED_VIDEO_MIME_TYPES:
+            raise ApiError(415, "UNSUPPORTED_VIDEO_TYPE", "仅支持 MP4、MOV 和 WebM 视频")
+        if duration_ms is not None and duration_ms > settings.media_max_video_duration_ms:
+            raise ApiError(
+                413,
+                "VIDEO_DURATION_EXCEEDED",
+                "视频时长超过当前技术策略",
+                details={"max_video_duration_ms": settings.media_max_video_duration_ms},
+            )
+    if size_bytes > settings.media_max_file_size_bytes:
+        raise ApiError(
+            413,
+            "MEDIA_TOO_LARGE",
+            "文件超过当前技术策略",
+            details={"max_file_size_bytes": settings.media_max_file_size_bytes},
+        )
+    active_sessions = int(
+        await session.scalar(
+            select(func.count(MediaUploadSession.id)).where(
+                MediaUploadSession.resident_device_id == uploader_device_id,
+                MediaUploadSession.status == "active",
+                MediaUploadSession.expires_at > utcnow(),
+            )
+        )
+        or 0
+    )
+    if active_sessions >= settings.media_single_device_active_sessions:
+        raise ApiError(
+            429,
+            "MEDIA_ACTIVE_SESSION_LIMIT",
+            "当前设备未完成上传会话过多",
+            details={"max_active_sessions": settings.media_single_device_active_sessions},
+        )
+    policy = media_policy(settings)
+    attachment = Attachment(
+        incident_id=incident_id,
+        uploader_device_id=uploader_device_id,
+        file_name=file_name,
+        declared_mime_type=mime_type,
+        media_type=media_type,
+        client_source=client_source,
+        storage_provider=settings.media_storage_provider,
+        bucket=settings.qiniu_bucket,
+        mime_type=None,
+        size_bytes=size_bytes,
+        expected_sha256=expected_sha256.lower(),
+        duration_ms=duration_ms,
+        metadata_status="pending",
+        malware_scan_status="pending",
+        ocr_status="pending" if media_type == "image" else "not_applicable",
+        vision_status="pending",
+        transcript_status="pending" if media_type == "video" else "not_applicable",
+        transcode_status="pending" if media_type == "video" else "not_applicable",
+        keyframe_status="pending" if media_type == "video" else "not_applicable",
+        policy_snapshot=policy,
+        upload_expires_at=utcnow() + timedelta(seconds=settings.qiniu_upload_token_ttl_seconds),
+    )
+    session.add(attachment)
+    await session.flush()
+    object_key = (
+        f"quarantine/incidents/{incident_id}/attachments/"
+        f"{attachment.id}{_object_suffix(file_name, mime_type)}"
+    )
+    attachment.object_key = object_key
+    token, fingerprint = _upload_token(
+        attachment_id=attachment.id,
+        object_key=object_key,
+        settings=settings,
+    )
+    mode = "resumable" if resumable_upload or media_type == "video" else "form"
+    upload: dict[str, object] = {
+        "mode": mode,
+        "method": "KODO_RESUMABLE_V2" if mode == "resumable" else "KODO_FORM",
+        "url": settings.qiniu_upload_host,
+        "fields": {"token": token, "key": object_key},
+        "recommended_chunk_size_bytes": settings.media_recommended_chunk_size_bytes,
+    }
+    if mode == "resumable":
+        upload["session_endpoint"] = f"/api/v1/uploads/{attachment.id}/resumable-sessions"
+    else:
+        upload["form_field"] = "file"
+    return attachment, {"policy": policy, "upload": upload}, fingerprint
+
+
+def _session_parts_payload(parts: list[MediaUploadPart]) -> list[dict[str, object]]:
+    return [
+        {
+            "part_number": part.part_number,
+            "offset": part.offset,
+            "size_bytes": part.size_bytes,
+            "etag": part.etag,
+            "sha256": part.sha256,
+        }
+        for part in sorted(parts, key=lambda item: item.part_number)
+    ]
+
+
+async def create_resumable_session(
+    session: AsyncSession,
+    *,
+    attachment: Attachment,
+    device_id: str,
+    size_bytes: int,
+    sha256: str,
+    client_checkpoint_id: str | None,
+    settings: Settings | None = None,
+) -> tuple[MediaUploadSession, str]:
+    settings = settings or get_settings()
+    if attachment.uploader_device_id != device_id:
+        raise ApiError(403, "ATTACHMENT_ACCESS_DENIED", "无权访问其他设备的附件")
+    if attachment.uploaded_at is not None:
+        raise ApiError(409, "UPLOAD_ALREADY_FINISHED", "该附件内容已经上传")
+    if attachment.size_bytes != size_bytes or attachment.expected_sha256 != sha256.lower():
+        raise ApiError(422, "UPLOAD_FINGERPRINT_MISMATCH", "上传会话文件指纹不匹配")
+    token, fingerprint = _upload_token(
+        attachment_id=attachment.id,
+        object_key=attachment.object_key or "",
+        settings=settings,
+    )
+    row = MediaUploadSession(
+        attachment_id=attachment.id,
+        resident_device_id=device_id,
+        provider=attachment.storage_provider,
+        mode="resumable",
+        object_key=attachment.object_key or "",
+        upload_token_fingerprint=fingerprint,
+        token_expires_at=utcnow() + timedelta(seconds=settings.qiniu_upload_token_ttl_seconds),
+        chunk_size_bytes=settings.media_recommended_chunk_size_bytes,
+        max_parallel_uploads=settings.media_max_parallel_uploads,
+        expected_size_bytes=size_bytes,
+        expected_sha256=sha256.lower(),
+        client_checkpoint_id=client_checkpoint_id,
+        policy_snapshot=attachment.policy_snapshot or media_policy(settings),
+        expires_at=utcnow() + timedelta(hours=settings.media_upload_session_hours),
+    )
+    session.add(row)
+    await session.flush()
+    return row, token
+
+
+async def record_resumable_part(
+    session: AsyncSession,
+    *,
+    upload_session: MediaUploadSession,
+    part_number: int,
+    offset: int,
+    size_bytes: int,
+    etag: str,
+    sha256: str | None,
+) -> MediaUploadPart:
+    if upload_session.status != "active":
+        raise ApiError(409, "UPLOAD_SESSION_NOT_ACTIVE", "上传会话不可写入分片")
+    if offset + size_bytes > upload_session.expected_size_bytes:
+        raise ApiError(422, "UPLOAD_PART_OUT_OF_RANGE", "分片范围超出文件大小")
+    existing = await session.scalar(
+        select(MediaUploadPart).where(
+            MediaUploadPart.upload_session_id == upload_session.id,
+            MediaUploadPart.part_number == part_number,
+        )
+    )
+    if existing is not None:
+        if (
+            existing.offset != offset
+            or existing.size_bytes != size_bytes
+            or existing.etag != etag
+            or existing.sha256 != sha256
+        ):
+            raise ApiError(409, "UPLOAD_PART_CONFLICT", "同一分片号已有不同检查点")
+        return existing
+    part = MediaUploadPart(
+        upload_session_id=upload_session.id,
+        part_number=part_number,
+        offset=offset,
+        size_bytes=size_bytes,
+        etag=etag,
+        sha256=sha256,
+    )
+    session.add(part)
+    await session.flush()
+    upload_session.confirmed_bytes = int(
+        await session.scalar(
+            select(func.coalesce(func.sum(MediaUploadPart.size_bytes), 0)).where(
+                MediaUploadPart.upload_session_id == upload_session.id
+            )
+        )
+        or 0
+    )
+    return part
+
+
+async def resumable_session_payload(
+    session: AsyncSession,
+    upload_session: MediaUploadSession,
+    *,
+    upload_token: str | None = None,
+) -> dict[str, object]:
+    parts = list(
+        (
+            await session.scalars(
+                select(MediaUploadPart).where(
+                    MediaUploadPart.upload_session_id == upload_session.id
+                )
+            )
+        ).all()
+    )
+    confirmed = _session_parts_payload(parts)
+    missing: list[dict[str, int]] = []
+    if upload_session.expected_size_bytes:
+        covered = {(part.offset, part.offset + part.size_bytes) for part in parts}
+        cursor = 0
+        for start, end in sorted(covered):
+            if cursor < start:
+                missing.append({"offset": cursor, "size_bytes": start - cursor})
+            cursor = max(cursor, end)
+        if cursor < upload_session.expected_size_bytes:
+            missing.append(
+                {
+                    "offset": cursor,
+                    "size_bytes": upload_session.expected_size_bytes - cursor,
+                }
+            )
+    payload: dict[str, object] = {
+        "session_id": upload_session.id,
+        "attachment_id": upload_session.attachment_id,
+        "provider": upload_session.provider,
+        "object_key": upload_session.object_key,
+        "status": upload_session.status,
+        "chunk_size_bytes": upload_session.chunk_size_bytes,
+        "max_parallel_uploads": upload_session.max_parallel_uploads,
+        "confirmed_bytes": upload_session.confirmed_bytes,
+        "confirmed_parts": confirmed,
+        "missing_parts": missing,
+        "policy": upload_session.policy_snapshot,
+        "token_expires_at": upload_session.token_expires_at,
+        "expires_at": upload_session.expires_at,
+    }
+    if upload_token is not None:
+        payload["upload"] = {
+            "mode": "resumable",
+            "method": "KODO_RESUMABLE_V2",
+            "url": get_settings().qiniu_upload_host,
+            "fields": {"token": upload_token, "key": upload_session.object_key},
+        }
+    return payload
+
+
+async def renew_resumable_session(
+    upload_session: MediaUploadSession,
+    settings: Settings | None = None,
+) -> str:
+    settings = settings or get_settings()
+    if upload_session.status != "active":
+        raise ApiError(409, "UPLOAD_SESSION_NOT_ACTIVE", "上传会话不可续签")
+    if upload_session.expires_at < utcnow():
+        raise ApiError(410, "UPLOAD_SESSION_EXPIRED", "上传会话已过期")
+    token, fingerprint = _upload_token(
+        attachment_id=upload_session.attachment_id,
+        object_key=upload_session.object_key,
+        settings=settings,
+    )
+    upload_session.upload_token_fingerprint = fingerprint
+    upload_session.token_expires_at = utcnow() + timedelta(
+        seconds=settings.qiniu_upload_token_ttl_seconds
+    )
+    return token
+
+
+async def complete_remote_upload(
+    session: AsyncSession,
+    *,
+    attachment: Attachment,
+    upload_session_id: str | None,
+    object_key: str | None,
+    etag: str | None,
+    size_bytes: int | None,
+    parts: list[object],
+) -> BackgroundJob:
+    if attachment.object_key and object_key and attachment.object_key != object_key:
+        raise ApiError(422, "UPLOAD_OBJECT_KEY_MISMATCH", "对象 Key 与上传意图不一致")
+    if size_bytes is not None and size_bytes != attachment.size_bytes:
+        raise ApiError(422, "UPLOAD_SIZE_MISMATCH", "上传内容大小与声明不一致")
+    if upload_session_id is not None:
+        upload_session = await session.get(MediaUploadSession, upload_session_id)
+        if (
+            upload_session is None
+            or upload_session.attachment_id != attachment.id
+            or upload_session.status != "active"
+        ):
+            raise ApiError(404, "UPLOAD_SESSION_NOT_FOUND", "上传会话不存在或不可用")
+        stored_parts = list(
+            (
+                await session.scalars(
+                    select(MediaUploadPart).where(
+                        MediaUploadPart.upload_session_id == upload_session.id
+                    )
+                )
+            ).all()
+        )
+        stored_size = sum(part.size_bytes for part in stored_parts)
+        declared_size = sum(getattr(part, "size_bytes", 0) for part in parts)
+        if stored_size != attachment.size_bytes or declared_size not in {0, stored_size}:
+            raise ApiError(422, "UPLOAD_PARTS_INCOMPLETE", "上传分片尚未完整确认")
+        upload_session.status = "completed"
+    attachment.etag = etag
+    attachment.sha256 = attachment.expected_sha256
+    attachment.uploaded_at = utcnow()
+    attachment.original_path = attachment.object_key
+    attachment.metadata_status = "pending"
+    attachment.malware_scan_status = "pending"
+    job = BackgroundJob(
+        job_type="media.process",
+        payload={"attachment_id": attachment.id},
+        max_attempts=get_settings().job_max_attempts,
+    )
+    session.add(job)
+    return job
+
+
+async def process_remote_media(
+    session: AsyncSession,
+    attachment_id: str,
+    settings: Settings | None = None,
+) -> Attachment:
+    settings = settings or get_settings()
+    attachment = await session.get(Attachment, attachment_id)
+    if attachment is None:
+        raise ApiError(404, "ATTACHMENT_NOT_FOUND", "附件不存在")
+    if not attachment.uploaded_at or not attachment.object_key:
+        raise ApiError(409, "UPLOAD_NOT_FINISHED", "上传尚未完成")
+    attachment.mime_type = attachment.declared_mime_type
+    attachment.malware_scan_status = "clean"
+    attachment.metadata_status = "ready"
+    attachment.processing_progress = 100
+    attachment.rejection_reason = None
+    if attachment.media_type == "image":
+        attachment.ocr_status = "unavailable"
+        attachment.vision_status = "unavailable"
+        attachment.vision_summary = "Mock Kodo image processing completed"
+    else:
+        attachment.ocr_status = "not_applicable"
+        attachment.vision_status = "unavailable"
+        attachment.transcript_status = "unavailable"
+        attachment.transcode_status = "ready"
+        attachment.keyframe_status = "ready"
+        public_base = settings.qiniu_public_base_url.rstrip("/")
+        attachment.cover_path = f"{public_base}/{attachment.object_key}.cover.jpg"
+        attachment.preview_path = f"{public_base}/{attachment.object_key}"
+        attachment.vision_summary = "Mock Kodo video processing completed"
     return attachment
 
 

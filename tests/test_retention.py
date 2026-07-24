@@ -492,12 +492,14 @@ async def test_worker_runtime_schedules_retention_task(
 
     monkeypatch.setattr(runtime, "_job_loop", idle)
     monkeypatch.setattr(runtime, "_outbox_loop", idle)
+    monkeypatch.setattr(runtime, "_notification_loop", idle)
     monkeypatch.setattr(runtime, "_retention_loop", idle)
     await runtime.start()
     try:
         assert {task.get_name() for task in runtime._tasks} == {
             "crisis-mosaic-jobs",
             "crisis-mosaic-outbox",
+            "crisis-mosaic-push",
             "crisis-mosaic-retention",
         }
     finally:

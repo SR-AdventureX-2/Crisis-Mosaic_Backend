@@ -12,11 +12,17 @@ _PRODUCTION_PLACEHOLDERS = {
     "development-only-change-me",
     "development-installation-pepper",
     "development-upload-signing-secret",
+    "development-pii-encryption-key",
+    "development-pii-blind-index-secret",
+    "development-push-token-secret",
     "ChangeMe-Admin-2026!",
     "ChangeMe-Operator-2026!",
     "replace-with-at-least-48-random-characters",
     "replace-with-independent-random-pepper",
     "replace-with-independent-random-secret",
+    "replace-with-independent-pii-encryption-key",
+    "replace-with-independent-pii-blind-index-secret",
+    "replace-with-independent-push-token-secret",
     "replace-with-a-strong-local-password",
     "replace-with-another-strong-local-password",
 }
@@ -90,6 +96,10 @@ class Settings(BaseSettings):
     refresh_token_days: int = 30
     installation_id_pepper: str = "development-installation-pepper"
     upload_signing_secret: str = "development-upload-signing-secret"
+    pii_encryption_key: str = "development-pii-encryption-key"
+    pii_blind_index_secret: str = "development-pii-blind-index-secret"
+    pii_encryption_key_version: str = "local-v1"
+    push_token_secret: str = "development-push-token-secret"
 
     bootstrap_admin_username: str = "admin"
     bootstrap_admin_password: str = "ChangeMe-Admin-2026!"
@@ -115,6 +125,27 @@ class Settings(BaseSettings):
     max_attachments_per_report: int = 5
     upload_intent_minutes: int = 10
     signed_download_minutes: int = 10
+    enable_video_upload: bool = False
+    media_storage_provider: Literal["local_proxy", "qiniu_kodo_mock", "qiniu_kodo"] = (
+        "qiniu_kodo_mock"
+    )
+    media_policy_version: str = "media-policy-local-v1"
+    media_max_file_size_bytes: int = 5 * 1024 * 1024 * 1024
+    media_max_report_total_bytes: int = 10 * 1024 * 1024 * 1024
+    media_max_attachment_count: int = 200
+    media_max_video_duration_ms: int = 2 * 60 * 60 * 1000
+    media_max_parallel_uploads: int = 3
+    media_recommended_chunk_size_bytes: int = 4 * 1024 * 1024
+    media_upload_session_hours: int = 24
+    media_single_device_active_sessions: int = 8
+    qiniu_access_key: str = ""
+    qiniu_secret_key: str = ""
+    qiniu_bucket: str = "crisis-mosaic-local"
+    qiniu_region: str = "mock"
+    qiniu_upload_host: str = "https://upload-mock.qiniu.local"
+    qiniu_public_base_url: str = "https://cdn-mock.qiniu.local"
+    qiniu_upload_token_ttl_seconds: int = 600
+    qiniu_callback_url: str = ""
     malware_scanner: Literal["windows_defender", "fake", "disabled"] = "windows_defender"
     defender_command: str = ""
     malware_scan_timeout_seconds: float = 60.0
@@ -147,10 +178,41 @@ class Settings(BaseSettings):
     business_retention_days: int = Field(default=180, ge=1)
     audit_retention_days: int = Field(default=365, ge=1)
     retention_cleanup_hours: float = Field(default=24.0, gt=0)
+    reporter_national_id_retention_days_after_incident: int = 30
+    reporter_contact_retention_days_after_incident: int = 90
+    reporter_max_retention_days: int = 180
+    reporter_reveal_mock_mfa_code: str = "000000"
+    push_notifications_enabled: bool = True
+    push_provider_mode: Literal["mock", "disabled"] = "mock"
+    push_allowed_app_ids: list[str] = Field(
+        default_factory=lambda: ["com.srstudio.advx2team.crisismosaic"]
+    )
+    push_allowed_providers: list[str] = Field(
+        default_factory=lambda: ["fcm", "apns", "huawei", "xiaomi", "oppo", "vivo", "honor"]
+    )
+    push_outbox_batch_size: int = 100
+    push_retry_max_attempts: int = 3
+    push_notification_ttl_seconds: int = 3600
+    push_deep_link_allowed_schemes: list[str] = Field(default_factory=lambda: ["crisismosaic"])
 
     @field_validator("cors_origins", mode="before")
     @classmethod
     def parse_cors_origins(cls, value: object) -> object:
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("["):
+                return json.loads(text)
+            return [item.strip() for item in text.split(",") if item.strip()]
+        return value
+
+    @field_validator(
+        "push_allowed_app_ids",
+        "push_allowed_providers",
+        "push_deep_link_allowed_schemes",
+        mode="before",
+    )
+    @classmethod
+    def parse_string_lists(cls, value: object) -> object:
         if isinstance(value, str):
             text = value.strip()
             if text.startswith("["):
@@ -172,6 +234,9 @@ class Settings(BaseSettings):
                 "jwt_secret": (self.jwt_secret, 32, 8),
                 "installation_id_pepper": (self.installation_id_pepper, 32, 8),
                 "upload_signing_secret": (self.upload_signing_secret, 32, 8),
+                "pii_encryption_key": (self.pii_encryption_key, 32, 8),
+                "pii_blind_index_secret": (self.pii_blind_index_secret, 32, 8),
+                "push_token_secret": (self.push_token_secret, 32, 8),
                 "bootstrap_admin_password": (self.bootstrap_admin_password, 16, 6),
                 "bootstrap_operator_password": (
                     self.bootstrap_operator_password,
@@ -199,9 +264,12 @@ class Settings(BaseSettings):
                         self.jwt_secret,
                         self.installation_id_pepper,
                         self.upload_signing_secret,
+                        self.pii_encryption_key,
+                        self.pii_blind_index_secret,
+                        self.push_token_secret,
                     }
                 )
-                != 3
+                != 6
             ):
                 raise ValueError("production signing secrets must be independent")
             if self.bootstrap_admin_password == self.bootstrap_operator_password:

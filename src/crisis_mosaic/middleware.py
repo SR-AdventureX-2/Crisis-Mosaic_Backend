@@ -73,6 +73,11 @@ def idempotency_eligible(method: str, path: str) -> bool:
         return False
     if path == "/api/v1/anonymous-sessions" or path.startswith("/api/v1/anonymous-sessions/"):
         return False
+    if (
+        path == "/api/v1/resident-device-sessions"
+        or path.startswith("/api/v1/resident-device-sessions/")
+    ):
+        return False
     if method.upper() == "PUT" and _UPLOAD_CONTENT_PATH.fullmatch(path):
         return False
     return not (method.upper() == "POST" and _REPORT_CREATE_PATH.fullmatch(path))
@@ -305,7 +310,10 @@ def _rate_limit_rule(request: Request) -> tuple[str, int] | None:
     actor_key = _actor_key(request)
     client_host = request.client.host if request.client else "unknown"
     incident = request.headers.get("X-Incident-Id", "none")
-    if method == "POST" and path == "/api/v1/anonymous-sessions":
+    if method == "POST" and path in {
+        "/api/v1/anonymous-sessions",
+        "/api/v1/resident-device-sessions",
+    }:
         return (
             f"anonymous_session:ip:{client_host}",
             settings.rate_limit_anonymous_sessions_per_minute,

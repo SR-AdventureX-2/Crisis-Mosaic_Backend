@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://crisis-mosaic.local/schemas/push-payload.json",
+  "title": "Crisis Mosaic Push Payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["notification", "data"],
+  "properties": {
+    "notification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "body"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "body": { "type": "string", "minLength": 1, "maxLength": 240 }
+      }
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "notification_id",
+        "business_event_id",
+        "incident_id",
+        "event_type",
+        "resource_type",
+        "resource_id",
+        "resource_revision",
+        "deep_link"
+      ],
+      "properties": {
+        "schema_version": { "const": "1" },
+        "notification_id": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "business_event_id": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "incident_id": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "event_type": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "resource_type": { "type": "string", "minLength": 1, "maxLength": 50 },
+        "resource_id": { "type": "string", "maxLength": 80 },
+        "resource_revision": { "type": "string", "maxLength": 20 },
+        "deep_link": { "type": "string", "maxLength": 300 }
+      }
+    }
+  }
+}

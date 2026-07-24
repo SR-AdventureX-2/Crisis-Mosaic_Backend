@@ -656,6 +656,21 @@ def test_openapi_self_hosted_swagger_and_realtime_schema(client: TestClient) -> 
     assert "payload" not in schema["required"]
     assert "payload" in schema["properties"]
 
+    push_schema = client.get("/schemas/push-payload.json")
+    assert push_schema.status_code == 200
+    assert push_schema.headers["content-type"].startswith("application/schema+json")
+    push_document = push_schema.json()
+    assert push_document["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+    assert push_document["properties"]["data"]["additionalProperties"] is False
+    assert {
+        "notification_id",
+        "business_event_id",
+        "incident_id",
+        "event_type",
+        "resource_type",
+        "deep_link",
+    } <= set(push_document["properties"]["data"]["required"])
+
 
 def test_question_realtime_visibility_honors_region_and_hides_spatial_targets() -> None:
     resident = Actor(

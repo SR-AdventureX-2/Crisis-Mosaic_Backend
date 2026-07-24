@@ -29,6 +29,7 @@ from ..models import (
     OutboxEvent,
     RefreshSession,
     Report,
+    ReporterContact,
     ReportRevision,
 )
 from ..utils import canonical_json, sha256_text, utcnow
@@ -47,6 +48,7 @@ class RetentionCleanupResult:
     audit_logs_deleted: int = 0
     incidents_anonymized: int = 0
     reports_anonymized: int = 0
+    reporter_contacts_anonymized: int = 0
     report_revisions_anonymized: int = 0
     attachments_anonymized: int = 0
     directed_answers_anonymized: int = 0
@@ -163,8 +165,14 @@ def _anonymize_attachment(attachment: Attachment) -> bool:
     attachment.original_path = None
     attachment.sanitized_path = None
     attachment.thumbnail_path = None
+    attachment.bucket = None
+    attachment.object_key = None
+    attachment.etag = None
     attachment.width = None
     attachment.height = None
+    attachment.duration_ms = None
+    attachment.cover_path = None
+    attachment.preview_path = None
     attachment.captured_at = None
     attachment.exif_data = None
     attachment.metadata_status = "expired"
@@ -173,9 +181,37 @@ def _anonymize_attachment(attachment: Attachment) -> bool:
     attachment.vision_status = "expired"
     attachment.ocr_text = None
     attachment.vision_summary = None
+    attachment.transcript_status = "expired"
+    attachment.transcript_text = None
+    attachment.transcode_status = "expired"
+    attachment.keyframe_status = "expired"
+    attachment.policy_snapshot = None
     attachment.rejection_reason = RETENTION_REASON
     attachment.uploaded_at = None
     return not already_anonymized
+
+
+def _anonymize_reporter_contact(contact: ReporterContact, now: datetime) -> bool:
+    if contact.anonymized_at is not None:
+        return False
+    contact.full_name_ciphertext = RETENTION_MARKER
+    contact.full_name_masked = RETENTION_MARKER
+    contact.mobile_ciphertext = RETENTION_MARKER
+    contact.mobile_blind_index = sha256_text(f"retention:{contact.id}:mobile")
+    contact.mobile_masked = RETENTION_MARKER
+    contact.national_id_ciphertext = None
+    contact.national_id_blind_index = None
+    contact.national_id_masked = None
+    contact.emergency_name_ciphertext = None
+    contact.emergency_name_masked = None
+    contact.emergency_mobile_ciphertext = None
+    contact.emergency_mobile_masked = None
+    contact.emergency_relation_ciphertext = None
+    contact.emergency_relation_masked = None
+    contact.rescue_notes_ciphertext = None
+    contact.encryption_key_version = "retention"
+    contact.anonymized_at = now
+    return True
 
 
 def _anonymize_answer(answer: DirectedAnswer) -> bool:
@@ -222,6 +258,20 @@ async def _anonymize_incident(
     for report in reports:
         if _anonymize_report(report, now):
             result.reports_anonymized += 1
+            changed = True
+
+    contacts = list(
+        (
+            await session.scalars(
+                select(ReporterContact).where(ReporterContact.incident_id == incident_id)
+            )
+        ).all()
+    )
+    for contact in contacts:
+        if contact.legal_hold:
+            continue
+        if _anonymize_reporter_contact(contact, now):
+            result.reporter_contacts_anonymized += 1
             changed = True
 
     if report_ids:
@@ -420,6 +470,20 @@ async def cleanup_retention_once(
                 AuditLog,
                 AuditLog.created_at <= audit_cutoff,
             )
+            expired_contacts = list(
+                (
+                    await session.scalars(
+                        select(ReporterContact).where(
+                            ReporterContact.retention_until <= now,
+                            ReporterContact.legal_hold.is_(False),
+                            ReporterContact.anonymized_at.is_(None),
+                        )
+                    )
+                ).all()
+            )
+            for contact in expired_contacts:
+                if _anonymize_reporter_contact(contact, now):
+                    result.reporter_contacts_anonymized += 1
 
             incident_ids = list(
                 (

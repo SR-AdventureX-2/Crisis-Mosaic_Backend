@@ -60,6 +60,13 @@ async def _seed(session: Any) -> tuple[Incident, AnonymousDevice, Actor]:
     return incident, device, actor
 
 
+def _reporter() -> dict[str, object]:
+    return {
+        "full_name": "张明",
+        "mobile": "13800138000",
+    }
+
+
 @pytest.mark.parametrize(
     "category",
     ["rescue", "medical", "water", "food", "shelter", "road"],
@@ -67,6 +74,7 @@ async def _seed(session: Any) -> tuple[Incident, AnonymousDevice, Actor]:
 def test_all_six_report_categories_are_accepted(category: str) -> None:
     payload = ReportCreate(
         category=category,
+        reporter=_reporter(),
         content_original="Need assistance",
         location={"text": "Daguan Bridge"},
     )
@@ -111,6 +119,7 @@ def test_create_report_writes_revision_priority_map_and_idempotency() -> None:
                     incident, _, actor = await _seed(session)
                     payload = ReportCreate(
                         category="rescue",
+                        reporter=_reporter(),
                         content_original="Two residents trapped",
                         location={
                             "text": "Daguan Bridge",
@@ -186,6 +195,7 @@ def test_location_replacement_clears_previous_coordinates_atomically() -> None:
                         actor=actor,
                         payload=ReportCreate(
                             category="road",
+                            reporter=_reporter(),
                             content_original="Road is flooded",
                             location={
                                 "text": "Old location",
@@ -222,6 +232,7 @@ def test_resident_cannot_access_another_devices_report() -> None:
                         actor=actor,
                         payload=ReportCreate(
                             category="water",
+                            reporter=_reporter(),
                             content_original="No drinking water",
                             location={"text": "Shelter A"},
                         ),

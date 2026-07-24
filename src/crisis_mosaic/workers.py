@@ -55,6 +55,7 @@ class WorkerRuntime:
         self._tasks = [
             asyncio.create_task(self._job_loop(), name="crisis-mosaic-jobs"),
             asyncio.create_task(self._outbox_loop(), name="crisis-mosaic-outbox"),
+            asyncio.create_task(self._notification_loop(), name="crisis-mosaic-push"),
             asyncio.create_task(self._retention_loop(), name="crisis-mosaic-retention"),
         ]
 
@@ -89,6 +90,20 @@ class WorkerRuntime:
                 raise
             except Exception:
                 logger.exception("outbox dispatch failed")
+            await self._wait(self.settings.job_poll_seconds)
+
+    async def _notification_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                from .services.notifications import deliver_notifications_batch
+
+                delivered = await deliver_notifications_batch(self.settings)
+                if delivered:
+                    continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("notification dispatch failed")
             await self._wait(self.settings.job_poll_seconds)
 
     async def _retention_loop(self) -> None:
@@ -183,6 +198,44 @@ class WorkerRuntime:
                                 payload={"attachment_id": attachment.id, "status": "ready"},
                             )
                         await session.commit()
+                elif job.job_type == "media.process":
+                    from .services.uploads import process_remote_media
+
+                    attachment = await process_remote_media(
+                        session,
+                        str(job.payload["attachment_id"]),
+                        self.settings,
+                    )
+                    with session.no_autoflush:
+                        incident = await session.get(Incident, attachment.incident_id)
+                    async with write_lock:
+                        if incident is not None:
+                            await record_audit(
+                                session,
+                                actor=None,
+                                incident_id=incident.id,
+                                action="attachment.ready",
+                                resource_type="attachment",
+                                resource_id=attachment.id,
+                                after={
+                                    "status": "ready",
+                                    "mime_type": attachment.mime_type,
+                                    "sha256": attachment.sha256,
+                                    "storage_provider": attachment.storage_provider,
+                                },
+                            )
+                            await emit_event(
+                                session,
+                                incident=incident,
+                                event_type="attachment.ready",
+                                resource_type="attachment",
+                                resource_id=attachment.id,
+                                resource_revision=1,
+                                visibility="owner",
+                                owner_device_id=attachment.uploader_device_id,
+                                payload={"attachment_id": attachment.id, "status": "ready"},
+                            )
+                        await session.commit()
                 elif job.job_type == "ai.analysis":
                     from .services.ai import process_analysis
 
@@ -195,7 +248,7 @@ class WorkerRuntime:
                 # Domain handlers may deliberately persist a rejected/failed resource.
                 try:
                     async with write_lock:
-                        if job.job_type == "attachment.process":
+                        if job.job_type in {"attachment.process", "media.process"}:
                             rejected_attachment = await session.get(
                                 Attachment,
                                 str(job.payload.get("attachment_id", "")),

@@ -18,11 +18,13 @@ from ..models import (
     Incident,
     MapFeature,
     Report,
+    ReporterContact,
     ReportRevision,
 )
 from ..schemas.reports import ReportCreate, ReportLocation
 from ..security import Actor
 from ..utils import as_utc, utcnow
+from .contacts import create_reporter_contact, serialize_contact_masked
 
 
 async def get_incident(session: AsyncSession, incident_id: str) -> Incident:
@@ -82,6 +84,7 @@ def report_snapshot(report: Report) -> dict[str, Any]:
         "id": report.id,
         "incident_id": report.incident_id,
         "reporter_device_id": report.reporter_device_id,
+        "reporter_contact_id": report.reporter_contact_id,
         "category": report.category,
         "content_original": report.content_original,
         "content_display": report.content_display,
@@ -118,10 +121,17 @@ def report_snapshot(report: Report) -> dict[str, Any]:
     }
 
 
-def serialize_report(report: Report, actor: Actor | None = None) -> dict[str, Any]:
+def serialize_report(
+    report: Report,
+    actor: Actor | None = None,
+    *,
+    contact: ReporterContact | None = None,
+) -> dict[str, Any]:
     snapshot = report_snapshot(report)
     snapshot.pop("reporter_device_id", None)
+    snapshot.pop("reporter_contact_id", None)
     snapshot.pop("manual_priority", None)
+    snapshot["reporter"] = serialize_contact_masked(contact)
     if actor is not None and not actor.is_resident:
         snapshot["source"] = {
             "type": "anonymous_device",
@@ -205,6 +215,27 @@ async def bind_attachments(
     report.attachment_count = len(attachments)
 
 
+async def replace_attachments(
+    session: AsyncSession,
+    *,
+    report: Report,
+    attachment_ids: list[str],
+) -> None:
+    current = list(
+        (
+            await session.scalars(
+                select(Attachment).where(
+                    Attachment.report_id == report.id,
+                    Attachment.incident_id == report.incident_id,
+                )
+            )
+        ).all()
+    )
+    for attachment in current:
+        attachment.report_id = None
+    await bind_attachments(session, report=report, attachment_ids=attachment_ids)
+
+
 async def upsert_report_map_feature(
     session: AsyncSession,
     report: Report,
@@ -249,7 +280,7 @@ async def upsert_report_map_feature(
         "priority": report.priority,
         "location_text": report.location_text,
     }
-    feature.private_data = {}
+    feature.private_data = {"owner_device_id": report.reporter_device_id}
     return feature
 
 
@@ -295,6 +326,14 @@ async def create_report(
         ai_refinement_id=payload.ai_refinement_id,
         revision=1,
     )
+    contact = create_reporter_contact(
+        incident=incident,
+        device_id=actor.subject_id,
+        reporter=payload.reporter,
+    )
+    session.add(contact)
+    await session.flush()
+    report.reporter_contact_id = contact.id
     apply_location(report, payload.location)
     session.add(report)
     await session.flush()

@@ -29,6 +29,7 @@ from .routers import (
     health,
     incidents,
     map,
+    notifications,
     questions,
     reports,
     uploads,
@@ -95,6 +96,7 @@ def create_app() -> FastAPI:
             {"name": "Reports", "description": "居民上报、版本、状态和优先级。"},
             {"name": "Map", "description": "事件地图视图、边界框与坐标系转换。"},
             {"name": "Uploads", "description": "隔离上传与安全图片内容。"},
+            {"name": "Notifications", "description": "指挥端 Push 设备、偏好、Outbox 和回执。"},
             {"name": "Questions & blind spots", "description": "盲区和定向问答。"},
             {"name": "Conflicts & facts", "description": "证据冲突、人工决策和事实版本链。"},
             {
@@ -159,6 +161,11 @@ def create_app() -> FastAPI:
         schema_path = Path(__file__).parent / "schemas" / "realtime_event.json"
         return FileResponse(schema_path, media_type="application/schema+json")
 
+    @app.get("/schemas/push-payload.json", include_in_schema=False)
+    async def push_payload_schema() -> FileResponse:
+        schema_path = Path(__file__).parent / "schemas" / "push_payload.json"
+        return FileResponse(schema_path, media_type="application/schema+json")
+
     prefix = settings.api_prefix
     for route in (
         auth.router,
@@ -167,6 +174,7 @@ def create_app() -> FastAPI:
         reports.router,
         map.router,
         uploads.router,
+        notifications.router,
         questions.router,
         conflicts.router,
         ai.router,

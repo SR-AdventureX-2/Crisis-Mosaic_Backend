@@ -1,7 +1,8 @@
 # Crisis Mosaic Backend
 
-Crisis Mosaic 的 FastAPI 单机功能型 P0 后端。它实现匿名居民上报、精确事件地图、
-图片证据、定向问答、冲突与事实版本链、AI 辅助分析、审计和 WebSocket 实时同步。
+Crisis Mosaic 的 FastAPI 单机功能型 P0 后端。它实现匿名居民上报、实名联络密文快照、
+事件地图、图片/视频媒体意图、定向问答、冲突与事实版本链、AI 辅助分析、审计、
+WebSocket 实时同步和指挥端 Push Outbox。
 
 本实现使用 SQLite、单个 Uvicorn worker 和本地文件存储，适合功能联调、比赛演示和
 单机部署。它不宣称满足 `backend.md` 中的生产容量、高可用或灾备指标。
@@ -10,13 +11,19 @@ Crisis Mosaic 的 FastAPI 单机功能型 P0 后端。它实现匿名居民上�
 
 - 本地账号与匿名设备 JWT 会话，Access Token 60 分钟，Refresh Token 单次轮换。
 - 六类居民上报、幂等创建、乐观锁更新、完整版本历史和人工优先级。
-- WGS84/GCJ-02 一次性标准化、精确点位地图、bbox 面积限制和 500 点安全上限。
-- 隔离图片上传、SHA-256、真实 MIME、Defender、Pillow 像素限制、EXIF 净化、
+- WGS84/GCJ-02 一次性标准化、角色过滤地图、居民侧他人上报约 100m 模糊化、
+  bbox 面积限制和 500 点安全上限。
+- 上报人姓名、手机号、紧急联系人和救援备注字段级加密，普通响应只返回脱敏摘要；
+  明文读取走独立 reveal API、mock MFA 和审计。
+- 旧本地图片三步上传继续保留；新媒体接口返回 Kodo Mock 直传 Token、对象 Key、
+  可恢复上传会话、分片检查点、续签、取消和完成校验。
+- 本地图片链路仍执行 SHA-256、真实 MIME、Defender、Pillow 像素限制、EXIF 净化、
   缩略图、感知哈希和重复来源聚类。
 - 盲区、定向问题、回答历史和结构化冲突自动检测；定向回答不会重复生成上报。
 - 多证据人工冲突决策、稳定事实头表和追加式事实版本链。
 - OpenAI-compatible AI：同步上报整理，异步冲突研判和态势简报。
-- SQLite 持久任务、租约重试、Transactional Outbox、WebSocket 补发和权限过滤。
+- SQLite 持久任务、租约重试、Transactional Outbox、通知 Outbox、WebSocket 补发
+  和权限过滤。
 - Prometheus HTTP 延迟、幂等、实时连接、任务、AI、冲突、盲区、地图和事实指标。
 - OpenAPI 3.1 与离线 Swagger UI；根路径自动跳转到 `/docs`。
 
@@ -86,7 +93,8 @@ JavaScript、CSS 和图标均由仓库自托管，不依赖 CDN。
 `BOOTSTRAP_OPERATOR_PASSWORD`。在 Swagger 中调用 `POST /api/v1/auth/token`
 （表单格式）获取令牌，然后点击 **Authorize** 输入 `Bearer` Token。
 
-匿名居民先调用 `POST /api/v1/anonymous-sessions`。`installation_id` 应由客户端生成，
+匿名居民先调用 `POST /api/v1/resident-device-sessions`（兼容旧
+`/anonymous-sessions`）。`installation_id` 应由客户端生成，
 至少包含 128 位随机熵，例如 22 个以上 URL-safe 随机字符。新匿名会话和匿名 Token
 轮换仅允许绑定 `active` 事件，不会跨事件续签到已关闭或尚未启用的事件。
 
@@ -97,13 +105,14 @@ JavaScript、CSS 和图标均由仓库自托管，不依赖 CDN。
 
 | 领域 | 主要端点 |
 | --- | --- |
-| 认证 | `/anonymous-sessions`、`/auth/token`、`/auth/refresh`、`/auth/me` |
-| 上报 | `/incidents/{id}/reports`、`/reports/{id}`、`/me/reports/recent` |
-| 图片 | `/uploads/image-intents`、`/uploads/{id}/content`、`/complete` |
+| 认证 | `/resident-device-sessions`、`/anonymous-sessions`、`/auth/token`、`/auth/me` |
+| 上报 | `/incidents/{id}/reports`、`/reports/{id}`、`/reporter-contact/reveal` |
+| 媒体 | `/uploads/image-intents`、`/uploads/media-intents`、`/resumable-sessions` |
 | 地图 | `/incidents/{id}/map-view` |
 | 问答 | `/blind-spots`、`/directed-questions`、`/my-answer`、`/fragments` |
 | 冲突事实 | `/conflicts`、`/decision`、`/fact-records` |
 | AI | `/ai/report-refinements`、`/conflicts/{id}/ai-analysis`、`/ai/analyses/{id}` |
+| 通知 | `/me/push-devices`、`/me/notification-preferences/{id}`、`/notifications/{id}/receipts` |
 | 运维 | `/health/live`、`/health/ready`、`/metrics` |
 
 创建业务资源时提交 `Idempotency-Key`。访问事件内资源时同时提交：
@@ -121,6 +130,10 @@ X-Incident-Id: <incident-uuid>
 图片采用三步协议：创建上传意图、向返回的 `upload_url` 发送原始二进制 `PUT`、调用
 `complete`。扫描器不可用时完成请求会返回不可用错误并失败关闭，不会排队后静默跳过
 恶意文件检查。
+
+新版媒体接口使用 `/uploads/media-intents`。服务端返回短期 Kodo Mock Upload Token、
+单对象 Key、技术策略快照和上传模式；客户端文件字节不经过业务后端。视频上传默认由
+`ENABLE_VIDEO_UPLOAD=false` 关闭，打开前应完成真实 Kodo、扫描和转码验收。
 
 WebSocket 地址为 `ws://127.0.0.1:8000/api/v1/realtime`。连接后 5 秒内发送：
 
@@ -147,6 +160,8 @@ Token 不得放在查询参数。实时事件 Schema 位于
 - 已关闭事件超过 `BUSINESS_RETENTION_DAYS`（默认 180 天）后，上报、回答、信息碎片、
   对应历史/冲突证据/AI 快照和地图投影中的居民敏感内容会被不可逆匿名化，本地附件
   也会删除。
+- 上报联系人默认按 `REPORTER_CONTACT_RETENTION_DAYS_AFTER_INCIDENT` 独立匿名化；
+  事件整体过期时同步清除联系人密文、远端对象 Key、媒体处理状态和策略快照。
 
 附件清理只允许删除解析后位于 `STORAGE_ROOT` 内的普通文件；越界路径或非文件路径会被
 跳过并记录告警。修改保留期前应先确认法规和备份要求。
@@ -195,8 +210,8 @@ python -m mypy src\crisis_mosaic
 alembic check
 ```
 
-真实 AI Key 与 Windows Defender 属于可选本机集成检查；常规测试使用 fake AI 和 fake
-scanner，不依赖外部服务。
+真实 AI Key、Windows Defender、真实 Kodo 和真实 Push provider 属于可选本机集成检查；
+常规测试使用 fake AI、fake scanner、Kodo Mock 和 Push Mock，不依赖外部服务。
 
 更多说明：
 

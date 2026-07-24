@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Header, Query, Request
+from fastapi import APIRouter, Header, Query, Request, Response
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.sql import Select
 
@@ -13,19 +13,26 @@ from ..db import write_lock
 from ..dependencies import ActorDep, IncidentHeader, SessionDep
 from ..domain.priority import effective_priority
 from ..errors import ApiError
-from ..models import Incident, Report, ReportRevision
+from ..models import Incident, Report, ReporterContact, ReportRevision
 from ..responses import success
 from ..schemas.reports import (
     ReportCategory,
     ReportCreate,
+    ReporterRevealRequest,
     ReportPatch,
     ReportPriority,
     ReportPriorityPatch,
     ReportStatus,
     ReportStatusPatch,
 )
+from ..services.contacts import (
+    authorize_reveal,
+    serialize_contact_plain,
+    update_reporter_contact,
+)
 from ..services.events import emit_event, record_audit
 from ..services.idempotency import finish, replay_or_reserve
+from ..services.notifications import enqueue_operator_notifications
 from ..services.reports import (
     ai_priority_from_refinement,
     apply_cursor,
@@ -37,6 +44,7 @@ from ..services.reports import (
     encode_cursor,
     get_incident,
     get_report,
+    replace_attachments,
     report_snapshot,
     serialize_report,
     upsert_report_map_feature,
@@ -84,6 +92,29 @@ async def _incident_for_report(session: SessionDep, report: Report) -> Incident:
     if incident is None:
         raise ApiError(404, "NOT_FOUND", "incident not found")
     return incident
+
+
+async def _contact_for_report(session: SessionDep, report: Report) -> ReporterContact | None:
+    if not report.reporter_contact_id:
+        return None
+    return await session.get(ReporterContact, report.reporter_contact_id)
+
+
+async def _contacts_for_reports(
+    session: SessionDep,
+    reports: list[Report],
+) -> dict[str, ReporterContact]:
+    ids = [report.reporter_contact_id for report in reports if report.reporter_contact_id]
+    if not ids:
+        return {}
+    rows = list(
+        (
+            await session.scalars(
+                select(ReporterContact).where(ReporterContact.id.in_(ids))
+            )
+        ).all()
+    )
+    return {row.id: row for row in rows}
 
 
 def _priority_rank() -> Any:
@@ -173,6 +204,7 @@ async def post_report(
                 actor=actor,
                 payload=payload,
             )
+            contact = await _contact_for_report(session, report)
             await record_audit(
                 session,
                 actor=actor,
@@ -183,7 +215,7 @@ async def post_report(
                 request_id=_request_id(request),
                 after=report_snapshot(report),
             )
-            await emit_event(
+            event = await emit_event(
                 session,
                 incident=incident,
                 event_type="report.created",
@@ -192,9 +224,25 @@ async def post_report(
                 resource_revision=report.revision,
                 visibility="owner",
                 owner_device_id=report.reporter_device_id,
-                payload=serialize_report(report),
+                payload=serialize_report(report, contact=contact),
             )
-            response = success(serialize_report(report, actor), request)
+            notification_event_type = (
+                "urgent_report.created" if report.is_urgent else "report.created"
+            )
+            await enqueue_operator_notifications(
+                session,
+                incident=incident,
+                business_event_id=str(event.payload["event_id"]),
+                event_type=notification_event_type,
+                priority=report.priority,
+                resource_type="report",
+                resource_id=report.id,
+                resource_revision=report.revision,
+                deep_link=f"crisismosaic://incidents/{incident.id}/reports/{report.id}",
+                title="Crisis Mosaic 紧急提醒",
+                body="收到一条新的高优先级现场上报，请打开应用查看。",
+            )
+            response = success(serialize_report(report, actor, contact=contact), request)
             finish(reservation, status_code=201, body=response)
             return response
 
@@ -256,9 +304,17 @@ async def list_reports(
     reports = list((await session.scalars(statement)).all())
     has_more = len(reports) > limit
     page = reports[:limit]
+    contacts = await _contacts_for_reports(session, page)
     next_cursor = encode_cursor(page[-1]) if has_more and page else None
     return success(
-        [serialize_report(item, actor) for item in page],
+        [
+            serialize_report(
+                item,
+                actor,
+                contact=contacts.get(item.reporter_contact_id or ""),
+            )
+            for item in page
+        ],
         request,
         meta={
             "total": total,
@@ -282,7 +338,8 @@ async def read_report(
     assert_report_access(actor, report)
     incident = await _incident_for_report(session, report)
     assert_incident_access(actor, incident, incident_header)
-    return success(serialize_report(report, actor), request)
+    contact = await _contact_for_report(session, report)
+    return success(serialize_report(report, actor, contact=contact), request)
 
 
 @router.get("/reports/{report_id}/history")
@@ -385,6 +442,28 @@ async def patch_report(
                 report.ai_refinement_id = payload.ai_refinement_id
             elif fields & {"category", "content_original", "location"}:
                 report.ai_refinement_id = None
+            if "reporter" in fields:
+                if payload.reporter is None:
+                    raise ApiError(422, "REPORTER_CONTACT_REQUIRED", "上报人联系方式不得清空")
+                previous_contact = await _contact_for_report(session, report)
+                if previous_contact is None:
+                    raise ApiError(409, "REPORTER_CONTACT_MISSING", "当前上报缺少联系人快照")
+                next_contact = update_reporter_contact(
+                    incident=incident,
+                    previous=previous_contact,
+                    patch=payload.reporter,
+                )
+                session.add(next_contact)
+                await session.flush()
+                report.reporter_contact_id = next_contact.id
+            if "attachment_ids" in fields:
+                if payload.attachment_ids is None:
+                    raise ApiError(422, "FIELD_NOT_NULLABLE", "attachment_ids cannot be null")
+                await replace_attachments(
+                    session,
+                    report=report,
+                    attachment_ids=payload.attachment_ids,
+                )
             refinement = await validate_report_refinement(
                 session,
                 analysis_id=report.ai_refinement_id,
@@ -436,14 +515,19 @@ async def patch_report(
                 resource_revision=report.revision,
                 visibility="owner",
                 owner_device_id=report.reporter_device_id,
-                payload=serialize_report(report),
+                payload=serialize_report(
+                    report,
+                    contact=await _contact_for_report(session, report),
+                ),
             )
-            return success(serialize_report(report, actor), request)
+            contact = await _contact_for_report(session, report)
+            return success(serialize_report(report, actor, contact=contact), request)
 
 
 @router.get("/me/reports/recent")
 async def recent_report(
     request: Request,
+    response: Response,
     session: SessionDep,
     actor: ActorDep,
     directed_answer: bool = False,
@@ -461,8 +545,77 @@ async def recent_report(
         .order_by(Report.updated_at.desc(), Report.id.desc())
         .limit(1)
     )
-    data = serialize_report(report, actor) if report is not None else None
+    if report is None:
+        return success(None, request)
+    contact = await _contact_for_report(session, report)
+    data = serialize_report(report, actor, contact=contact)
+    if contact is not None:
+        data["reporter"] = serialize_contact_plain(contact)
+    response.headers["Cache-Control"] = "no-store"
     return success(data, request)
+
+
+@router.post("/reports/{report_id}/reporter-contact/reveal")
+async def reveal_reporter_contact(
+    report_id: str,
+    payload: ReporterRevealRequest,
+    request: Request,
+    response: Response,
+    session: SessionDep,
+    actor: ActorDep,
+    incident_header: IncidentHeader,
+) -> dict[str, Any]:
+    report = await get_report(session, report_id)
+    assert_report_access(actor, report)
+    incident = await _incident_for_report(session, report)
+    assert_incident_access(actor, incident, incident_header)
+    contact = await _contact_for_report(session, report)
+    if contact is None:
+        raise ApiError(404, "REPORTER_CONTACT_NOT_FOUND", "联系人快照不存在")
+    allowed = False
+    try:
+        authorize_reveal(actor, payload.mfa_code)
+        allowed = True
+    finally:
+        async with write_lock:
+            try:
+                await record_audit(
+                    session,
+                    actor=actor,
+                    incident_id=incident.id,
+                    action=(
+                        "reporter_contact.reveal_succeeded"
+                        if allowed
+                        else "reporter_contact.reveal_denied"
+                    ),
+                    resource_type="reporter_contact",
+                    resource_id=contact.id,
+                    request_id=_request_id(request),
+                    metadata={
+                        "reason_code": payload.reason_code,
+                        "ticket_ref": payload.ticket_ref,
+                        "fields": payload.fields,
+                    },
+                )
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+    plain = serialize_contact_plain(contact)
+    selected: dict[str, Any] = {}
+    for field in payload.fields:
+        if field == "full_name":
+            selected["full_name"] = plain["full_name"]
+        elif field == "mobile":
+            selected["mobile"] = plain["mobile"]
+        elif field == "national_id":
+            selected["national_id"] = plain["additional_info"]["national_id"]
+        elif field == "emergency_contact":
+            selected["emergency_contact"] = plain["additional_info"]["emergency_contact"]
+        elif field == "rescue_notes":
+            selected["rescue_notes"] = plain["additional_info"]["rescue_notes"]
+    response.headers["Cache-Control"] = "no-store"
+    return success({"report_id": report.id, "reporter": selected}, request)
 
 
 @router.patch("/reports/{report_id}/status")
@@ -531,7 +684,7 @@ async def patch_report_status(
                 after=snapshot,
                 metadata={"note": payload.note},
             )
-            await emit_event(
+            event = await emit_event(
                 session,
                 incident=incident,
                 event_type="report.status_changed",
@@ -540,9 +693,26 @@ async def patch_report_status(
                 resource_revision=report.revision,
                 visibility="owner",
                 owner_device_id=report.reporter_device_id,
-                payload=serialize_report(report),
+                payload=serialize_report(
+                    report,
+                    contact=await _contact_for_report(session, report),
+                ),
             )
-            return success(serialize_report(report, actor), request)
+            await enqueue_operator_notifications(
+                session,
+                incident=incident,
+                business_event_id=str(event.payload["event_id"]),
+                event_type="report.status_changed",
+                priority=report.priority,
+                resource_type="report",
+                resource_id=report.id,
+                resource_revision=report.revision,
+                deep_link=f"crisismosaic://incidents/{incident.id}/reports/{report.id}",
+                title="Crisis Mosaic 上报状态更新",
+                body="一条现场上报状态已更新，请打开应用查看。",
+            )
+            contact = await _contact_for_report(session, report)
+            return success(serialize_report(report, actor, contact=contact), request)
 
 
 @router.patch("/reports/{report_id}/priority")
@@ -615,7 +785,7 @@ async def patch_report_priority(
                 after=snapshot,
                 metadata={"note": payload.note},
             )
-            await emit_event(
+            event = await emit_event(
                 session,
                 incident=incident,
                 event_type="report.priority_updated",
@@ -624,6 +794,23 @@ async def patch_report_priority(
                 resource_revision=report.revision,
                 visibility="owner",
                 owner_device_id=report.reporter_device_id,
-                payload=serialize_report(report),
+                payload=serialize_report(
+                    report,
+                    contact=await _contact_for_report(session, report),
+                ),
             )
-            return success(serialize_report(report, actor), request)
+            await enqueue_operator_notifications(
+                session,
+                incident=incident,
+                business_event_id=str(event.payload["event_id"]),
+                event_type="report.priority_updated",
+                priority=report.priority,
+                resource_type="report",
+                resource_id=report.id,
+                resource_revision=report.revision,
+                deep_link=f"crisismosaic://incidents/{incident.id}/reports/{report.id}",
+                title="Crisis Mosaic 优先级更新",
+                body="一条现场上报优先级已更新，请打开应用查看。",
+            )
+            contact = await _contact_for_report(session, report)
+            return success(serialize_report(report, actor, contact=contact), request)

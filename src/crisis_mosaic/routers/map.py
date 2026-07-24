@@ -88,6 +88,26 @@ def _position(feature: MapFeature, coordinate_system: str) -> tuple[float, float
     return feature.latitude_gcj02, feature.longitude_gcj02
 
 
+def _is_owner_report(feature: MapFeature, actor: Any) -> bool:
+    private_data = feature.private_data or {}
+    return (
+        actor.is_resident
+        and feature.kind == "report"
+        and private_data.get("owner_device_id") == actor.subject_id
+    )
+
+
+def _resident_position(
+    feature: MapFeature,
+    actor: Any,
+    coordinate_system: str,
+) -> tuple[float, float, str]:
+    latitude, longitude = _position(feature, coordinate_system)
+    if not actor.is_resident or feature.kind != "report" or _is_owner_report(feature, actor):
+        return latitude, longitude, "exact"
+    return round(latitude, 3), round(longitude, 3), "fuzzy_100m"
+
+
 @router.get("/incidents/{incident_id}/map-view")
 async def map_view(
     incident_id: str,
@@ -205,21 +225,31 @@ async def map_view(
         }
     items: list[dict[str, Any]] = []
     for feature in features:
-        latitude, longitude = _position(feature, coordinate_system)
+        latitude, longitude, precision = _resident_position(feature, actor, coordinate_system)
         visible_data = (
             feature.public_data or {}
             if actor.is_resident
             else {**(feature.public_data or {}), **(feature.private_data or {})}
         )
+        if actor.is_resident and feature.kind == "report" and precision != "exact":
+            visible_data = {
+                key: value
+                for key, value in visible_data.items()
+                if key != "location_text"
+            }
         public_data = {
             key: value for key, value in visible_data.items() if key in _PUBLIC_MAP_FIELDS
         }
+        title = feature.title
+        if actor.is_resident and feature.kind == "report" and precision != "exact":
+            title = "现场上报位置已模糊化"
         items.append(
             {
                 "id": f"{feature.kind}:{feature.source_ref}",
                 "kind": feature.kind,
                 "position": {"latitude": latitude, "longitude": longitude},
-                "title": feature.title,
+                "position_precision": precision,
+                "title": title,
                 "status": feature.status,
                 "severity": feature.severity,
                 "source_ref": feature.source_ref,

@@ -87,6 +87,7 @@ async def _issue_pair(
     return data, refresh, refresh_token
 
 
+@router.post("/resident-device-sessions", status_code=status.HTTP_201_CREATED)
 @router.post("/anonymous-sessions", status_code=status.HTTP_201_CREATED)
 async def create_anonymous_session(
     body: AnonymousSessionCreate,
@@ -297,6 +298,7 @@ async def refresh_account(
     return await _rotate_refresh(body.refresh_token, request, session, expected_type="account")
 
 
+@router.post("/resident-device-sessions/refresh")
 @router.post("/anonymous-sessions/refresh")
 async def refresh_anonymous(
     body: RefreshRequest,
@@ -324,6 +326,7 @@ async def logout(
     return success({"revoked": True}, request)
 
 
+@router.post("/resident-device-sessions/revoke")
 @router.post("/anonymous-sessions/revoke")
 async def revoke_anonymous(
     body: RefreshRequest,
