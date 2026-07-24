@@ -280,7 +280,6 @@ def client(
         installation_id_pepper="integration-test-installation-pepper",
         upload_signing_secret="integration-test-upload-signing-secret",
         ai_provider="fake",
-        malware_scanner="fake",
         realtime_replay_hours=24,
         realtime_heartbeat_seconds=30,
     )

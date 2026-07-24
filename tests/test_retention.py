@@ -67,7 +67,6 @@ async def test_retention_cleanup_purges_and_anonymizes_idempotently(
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'retention.db'}",
         data_dir=tmp_path,
         storage_root=tmp_path / "uploads",
-        malware_scanner="fake",
         business_retention_days=10,
         audit_retention_days=20,
         realtime_replay_hours=24,
@@ -483,7 +482,6 @@ async def test_worker_runtime_schedules_retention_task(
         app_env="test",
         data_dir=tmp_path,
         storage_root=tmp_path / "uploads",
-        malware_scanner="fake",
     )
     runtime = WorkerRuntime(settings)
 

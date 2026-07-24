@@ -16,7 +16,7 @@ from crisis_mosaic.middleware import redact
 from crisis_mosaic.schemas.ai import ReportRefinementOutput
 from crisis_mosaic.services.ai import _invoke_structured
 from crisis_mosaic.services.ai_prompts import REPORT_REFINEMENT_PROMPT_VERSION, get_prompt_spec
-from crisis_mosaic.services.uploads import _sanitize_image, _scan_file
+from crisis_mosaic.services.uploads import _sanitize_image
 
 
 def _openai_settings() -> Settings:
@@ -47,26 +47,6 @@ def test_prompt_specs_render_task_specific_placeholders() -> None:
         assert "{{" not in rendered
 
 
-@pytest.mark.asyncio
-async def test_fake_scanner_detects_eicar_signature(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sample = tmp_path / "eicar.txt"
-    monkeypatch.setattr(
-        Path,
-        "read_bytes",
-        lambda _path: b"EICAR-" + b"STANDARD-ANTIVIRUS test marker",
-    )
-    settings = Settings(app_env="test", malware_scanner="fake")
-
-    with pytest.raises(ApiError) as error:
-        await _scan_file(sample, settings)
-
-    assert error.value.status_code == 422
-    assert error.value.code == "MALWARE_DETECTED"
-
-
 def test_image_sanitizer_rejects_pixel_bomb_before_writing_derivatives(
     tmp_path: Path,
 ) -> None:
@@ -77,7 +57,6 @@ def test_image_sanitizer_rejects_pixel_bomb_before_writing_derivatives(
         data_dir=tmp_path,
         storage_root=tmp_path / "uploads",
         max_image_pixels=1_000,
-        malware_scanner="fake",
     )
     settings.ensure_directories()
     previous_limit = Image.MAX_IMAGE_PIXELS

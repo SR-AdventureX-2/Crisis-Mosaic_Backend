@@ -67,7 +67,6 @@ def idempotency_client(
         installation_id_pepper="idempotency-test-installation-pepper",
         upload_signing_secret="idempotency-test-upload-signing-secret",
         ai_provider="fake",
-        malware_scanner="fake",
         rate_limit_anonymous_sessions_per_minute=1,
     )
     engine = create_async_engine(database_url)

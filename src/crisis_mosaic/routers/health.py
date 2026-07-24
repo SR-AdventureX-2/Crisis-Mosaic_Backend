@@ -24,12 +24,6 @@ async def live(request: Request) -> dict[str, object]:
 async def ready(request: Request, response: Response) -> dict[str, object]:
     settings = get_settings()
     database = await check_database()
-    try:
-        from ..services.uploads import scanner_available
-
-        scanner = await scanner_available(settings)
-    except (ImportError, AttributeError):
-        scanner = settings.malware_scanner in {"fake", "disabled"}
     core_ready = database
     if not core_ready:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -38,7 +32,6 @@ async def ready(request: Request, response: Response) -> dict[str, object]:
             "status": "ready" if core_ready else "not_ready",
             "checks": {
                 "database": "ok" if database else "failed",
-                "image_scanner": "ok" if scanner else "unavailable_fail_closed",
                 "ai": "configured" if settings.ai_configured else "degraded_not_configured",
             },
             "limitations": {

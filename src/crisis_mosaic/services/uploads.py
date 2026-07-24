@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import secrets
-import shutil
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -621,55 +620,6 @@ async def queue_processing(
     return job
 
 
-async def _scan_file(path: Path, settings: Settings) -> None:
-    if settings.malware_scanner == "fake":
-        content = await asyncio.to_thread(path.read_bytes)
-        if content.startswith(b"EICAR") or b"EICAR-STANDARD-ANTIVIRUS" in content:
-            raise ApiError(422, "MALWARE_DETECTED", "恶意文件扫描未通过")
-        return
-    if settings.malware_scanner == "disabled":
-        raise ApiError(503, "MALWARE_SCANNER_UNAVAILABLE", "恶意文件扫描器未启用")
-    command = settings.defender_command.strip()
-    executable = (
-        Path(command)
-        if command
-        else Path(shutil.which("MpCmdRun.exe") or r"C:\Program Files\Windows Defender\MpCmdRun.exe")
-    )
-    if not await asyncio.to_thread(executable.is_file):
-        raise ApiError(503, "MALWARE_SCANNER_UNAVAILABLE", "Windows Defender 扫描器不可用")
-    process = await asyncio.create_subprocess_exec(
-        str(executable),
-        "-Scan",
-        "-ScanType",
-        "3",
-        "-File",
-        str(path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(),
-            timeout=settings.malware_scan_timeout_seconds,
-        )
-    except TimeoutError as exc:
-        process.kill()
-        await process.communicate()
-        raise ApiError(
-            503,
-            "MALWARE_SCANNER_TIMEOUT",
-            "恶意文件扫描超时",
-        ) from exc
-    if process.returncode != 0:
-        message = (stdout + stderr).decode(errors="replace")[-500:]
-        raise ApiError(
-            422 if process.returncode == 2 else 503,
-            "MALWARE_DETECTED" if process.returncode == 2 else "MALWARE_SCANNER_FAILED",
-            "恶意文件扫描未通过" if process.returncode == 2 else "恶意文件扫描失败",
-            details={"scanner_output": message},
-        )
-
-
 def _sanitize_image(
     source: Path, attachment_id: str, settings: Settings
 ) -> tuple[Path, Path, str, int, int, str, dict[str, str], datetime | None]:
@@ -737,21 +687,6 @@ def _sanitize_image(
 ALLOWED_FORMAT_TO_MIME = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
 
 
-async def scanner_available(settings: Settings | None = None) -> bool:
-    settings = settings or get_settings()
-    if settings.malware_scanner == "fake":
-        return True
-    if settings.malware_scanner == "disabled":
-        return False
-    command = settings.defender_command.strip()
-    executable = (
-        Path(command)
-        if command
-        else Path(shutil.which("MpCmdRun.exe") or r"C:\Program Files\Windows Defender\MpCmdRun.exe")
-    )
-    return await asyncio.to_thread(executable.is_file)
-
-
 async def process_attachment(
     session: AsyncSession,
     attachment_id: str,
@@ -773,7 +708,6 @@ async def process_attachment(
         actual = await asyncio.to_thread(_hash_path, source)
         if actual != attachment.expected_sha256 or actual != attachment.sha256:
             raise ApiError(422, "UPLOAD_HASH_MISMATCH", "处理前文件哈希复核失败")
-        await _scan_file(source, settings)
         attachment.malware_scan_status = "clean"
         result = await asyncio.to_thread(_sanitize_image, source, attachment.id, settings)
         (
@@ -836,9 +770,7 @@ async def process_attachment(
     except ApiError as exc:
         attachment.metadata_status = "rejected"
         if attachment.malware_scan_status == "pending":
-            attachment.malware_scan_status = (
-                "infected" if exc.code == "MALWARE_DETECTED" else "failed"
-            )
+            attachment.malware_scan_status = "failed"
         attachment.rejection_reason = exc.code
         raise
 

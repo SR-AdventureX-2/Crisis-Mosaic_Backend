@@ -76,7 +76,6 @@ def anonymous_client(
         installation_id_pepper="test-installation-pepper-with-enough-entropy",
         upload_signing_secret="test-upload-secret-with-enough-entropy",
         ai_provider="fake",
-        malware_scanner="fake",
         rate_limit_enabled=False,
     )
     engine = create_async_engine(database_url)

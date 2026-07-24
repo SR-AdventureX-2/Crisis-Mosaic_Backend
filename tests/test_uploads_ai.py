@@ -150,7 +150,6 @@ async def test_stream_upload_checks_hash_and_size(tmp_path: Path) -> None:
         app_env="test",
         storage_root=tmp_path / "uploads",
         data_dir=tmp_path,
-        malware_scanner="fake",
         max_image_bytes=len(content) + 100,
     )
     attachment = Attachment(
@@ -195,7 +194,6 @@ async def test_image_processing_sanitizes_and_clusters_duplicates(tmp_path: Path
         app_env="test",
         storage_root=tmp_path / "uploads",
         data_dir=tmp_path,
-        malware_scanner="fake",
         ai_provider="fake",
     )
     settings.ensure_directories()

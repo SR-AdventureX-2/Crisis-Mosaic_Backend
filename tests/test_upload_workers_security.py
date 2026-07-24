@@ -8,10 +8,9 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from fastapi import Request
 from PIL import Image
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -29,9 +28,7 @@ from crisis_mosaic.models import (
     Incident,
     OutboxEvent,
 )
-from crisis_mosaic.routers.uploads import complete_upload
 from crisis_mosaic.schemas.uploads import ImageIntentRequest
-from crisis_mosaic.security import Actor
 from crisis_mosaic.services.uploads import (
     attachment_state,
     process_attachment,
@@ -122,7 +119,6 @@ async def test_stream_upload_rejects_over_limit_and_removes_partial_file(
         app_env="test",
         data_dir=tmp_path,
         storage_root=tmp_path / "uploads",
-        malware_scanner="fake",
         max_image_bytes=4,
     )
     attachment = Attachment(
@@ -156,7 +152,6 @@ async def test_stream_upload_rejects_hash_mismatch_and_removes_file(
         app_env="test",
         data_dir=tmp_path,
         storage_root=tmp_path / "uploads",
-        malware_scanner="fake",
         max_image_bytes=1024,
     )
     attachment = Attachment(
@@ -187,7 +182,6 @@ async def test_processing_rejects_declared_mime_spoof(tmp_path: Path) -> None:
         app_env="test",
         data_dir=tmp_path,
         storage_root=tmp_path / "uploads",
-        malware_scanner="fake",
         ai_provider="fake",
     )
     try:
@@ -213,87 +207,6 @@ async def test_processing_rejects_declared_mime_spoof(tmp_path: Path) -> None:
             assert rejected.rejection_reason == "DECLARED_MIME_MISMATCH"
             assert rejected.sanitized_path is None
             assert rejected.thumbnail_path is None
-    finally:
-        await engine.dispose()
-
-
-@pytest.mark.asyncio
-async def test_upload_complete_fails_closed_when_scanner_is_unavailable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    engine, maker = await _database(tmp_path / "scanner-route.db")
-    settings = Settings(
-        app_env="test",
-        data_dir=tmp_path,
-        storage_root=tmp_path / "uploads",
-        malware_scanner="disabled",
-    )
-    monkeypatch.setattr("crisis_mosaic.routers.uploads.get_settings", lambda: settings)
-    try:
-        async with maker() as session:
-            incident, device, attachment = await _seed_uploaded_attachment(
-                session, settings, _image_bytes()
-            )
-            actor = Actor(
-                subject_type="device",
-                subject_id=device.id,
-                role="resident",
-                token_version=1,
-                incident_ids=frozenset({incident.id}),
-            )
-            request = Request(
-                {
-                    "type": "http",
-                    "method": "POST",
-                    "path": f"/api/v1/uploads/{attachment.id}/complete",
-                    "headers": [],
-                }
-            )
-            with pytest.raises(ApiError) as error:
-                await complete_upload(
-                    attachment.id,
-                    request,
-                    actor,
-                    session,
-                    None,
-                )
-
-            assert error.value.status_code == 503
-            assert error.value.code == "MALWARE_SCANNER_UNAVAILABLE"
-            jobs = await session.scalar(select(func.count(BackgroundJob.id)))
-            assert jobs == 0
-    finally:
-        await engine.dispose()
-
-
-@pytest.mark.asyncio
-async def test_processor_records_fail_closed_rejection_without_scanner(
-    tmp_path: Path,
-) -> None:
-    engine, maker = await _database(tmp_path / "scanner-worker.db")
-    settings = Settings(
-        app_env="test",
-        data_dir=tmp_path,
-        storage_root=tmp_path / "uploads",
-        malware_scanner="disabled",
-    )
-    try:
-        async with maker() as session:
-            _, _, attachment = await _seed_uploaded_attachment(session, settings, _image_bytes())
-            attachment_id = attachment.id
-            with pytest.raises(ApiError) as error:
-                await process_attachment(session, attachment_id, settings)
-            await session.commit()
-
-        assert error.value.status_code == 503
-        assert error.value.code == "MALWARE_SCANNER_UNAVAILABLE"
-        async with maker() as session:
-            rejected = await session.get(Attachment, attachment_id)
-            assert rejected is not None
-            assert attachment_state(rejected) == "rejected"
-            assert rejected.metadata_status == "rejected"
-            assert rejected.malware_scan_status == "failed"
-            assert rejected.rejection_reason == "MALWARE_SCANNER_UNAVAILABLE"
     finally:
         await engine.dispose()
 

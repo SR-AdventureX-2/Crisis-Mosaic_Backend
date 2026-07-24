@@ -31,7 +31,6 @@ from ..services.uploads import (
     record_resumable_part,
     renew_resumable_session,
     resumable_session_payload,
-    scanner_available,
     stream_request_to_quarantine,
 )
 from ..utils import isoformat, utcnow
@@ -263,12 +262,6 @@ async def complete_upload(
         raise ApiError(404, "ATTACHMENT_NOT_FOUND", "附件不存在")
     _authorize_attachment(actor, attachment, incident_header)
     settings = get_settings()
-    if attachment.storage_provider == "local_proxy" and not await scanner_available(settings):
-        raise ApiError(
-            503,
-            "MALWARE_SCANNER_UNAVAILABLE",
-            "恶意文件扫描器不可用；上传内容不会进入处理队列",
-        )
     incident = await session.get(Incident, attachment.incident_id)
     if incident is None:
         raise ApiError(404, "INCIDENT_NOT_FOUND", "事件不存在")

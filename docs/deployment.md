@@ -4,7 +4,6 @@
 
 - Windows 11 或 Windows Server，Python 3.12。
 - 一个可写的本地数据目录。
-- Windows Defender `MpCmdRun.exe`，或测试环境明确使用 fake scanner。
 - OpenAI-compatible API Key（仅 AI 功能需要）。
 - 真实 Kodo、FCM/APNs 或厂商 Push 凭证仅在接入生产通道时需要；默认使用 Mock。
 
@@ -77,24 +76,11 @@ Invoke-RestMethod http://127.0.0.1:8000/api/v1/health/live
 Invoke-RestMethod http://127.0.0.1:8000/api/v1/health/ready
 ```
 
-`ready` 将分别报告数据库、图片扫描器和 AI。AI 未配置属于降级状态；数据库不可用会返回
-503。扫描器不可用时图片处理失败关闭。
+`ready` 将分别报告数据库和 AI。AI 未配置属于降级状态；数据库不可用会返回 503。
 
 AI 提示词版本固定在代码中，运行时配置只选择模型、超时、JSON Schema 支持能力和
 provider。分析状态接口会返回 `prompt_sha256`、token 用量、Schema 校验状态和引用校验
 状态，便于审计同一模型在不同版本提示词下的输出。
-
-## Windows Defender
-
-如果 `MpCmdRun.exe` 不在 PATH，设置：
-
-```dotenv
-MALWARE_SCANNER=windows_defender
-DEFENDER_COMMAND=C:/Program Files/Windows Defender/MpCmdRun.exe
-```
-
-常规自动化测试设置 `MALWARE_SCANNER=fake`。`disabled` 不表示跳过扫描，而是使图片处理
-返回不可用错误。
 
 ## 媒体与 Kodo
 
@@ -170,7 +156,6 @@ python -c "import sqlite3; c=sqlite3.connect('data/crisis_mosaic.db'); print(c.e
 
 - `NO_ACTIVE_INCIDENT`：运行种子，或由管理员创建并启用事件。
 - `AI_SERVICE_UNAVAILABLE`：检查 `AI_PROVIDER/AI_BASE_URL/AI_API_KEY`。
-- `MALWARE_SCANNER_UNAVAILABLE`：检查 Defender 路径和运行账号权限。
 - `already has an active API process`：停止使用同一 `DATA_DIR` 的旧进程，并确保
   `--workers 1`。
 - `database is locked`：确认没有长时间外部 SQLite 事务；应用自身写入已串行化。

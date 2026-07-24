@@ -17,7 +17,7 @@ WebSocket 实时同步和指挥端 Push Outbox。
   明文读取走独立 reveal API、mock MFA 和审计。
 - 旧本地图片三步上传继续保留；新媒体接口返回 Kodo Mock 直传 Token、对象 Key、
   可恢复上传会话、分片检查点、续签、取消和完成校验。
-- 本地图片链路仍执行 SHA-256、真实 MIME、Defender、Pillow 像素限制、EXIF 净化、
+- 本地图片链路仍执行 SHA-256、真实 MIME、Pillow 像素限制、EXIF 净化、
   缩略图、感知哈希和重复来源聚类。
 - 盲区、定向问题、回答历史和结构化冲突自动检测；定向回答不会重复生成上报。
 - 多证据人工冲突决策、稳定事实头表和追加式事实版本链。
@@ -128,8 +128,7 @@ X-Incident-Id: <incident-uuid>
 避免在结果未知时自动重复写入；此时应由操作员查询资源状态，不应更换键盲目重试。
 
 图片采用三步协议：创建上传意图、向返回的 `upload_url` 发送原始二进制 `PUT`、调用
-`complete`。扫描器不可用时完成请求会返回不可用错误并失败关闭，不会排队后静默跳过
-恶意文件检查。
+`complete`。完成请求会校验哈希并进入处理队列进行 MIME、像素与 EXIF 净化。
 
 新版媒体接口使用 `/uploads/media-intents`。服务端返回短期 Kodo Mock Upload Token、
 单对象 Key、技术策略快照和上传模式；客户端文件字节不经过业务后端。视频上传默认由
@@ -219,8 +218,8 @@ python -m mypy src\crisis_mosaic
 alembic check
 ```
 
-真实 AI Key、Windows Defender、真实 Kodo 和真实 Push provider 属于可选本机集成检查；
-常规测试使用 fake AI、fake scanner、Kodo Mock 和 Push Mock，不依赖外部服务。
+真实 AI Key、真实 Kodo 和真实 Push provider 属于可选本机集成检查；
+常规测试使用 fake AI、Kodo Mock 和 Push Mock，不依赖外部服务。
 
 更多说明：
 

@@ -35,7 +35,7 @@ python -m pytest
 - 写事务必须使用共享 `write_lock`，并保持短小。
 - 创建接口应支持 `Idempotency-Key`；更新接口使用 revision CAS。
 - 禁止记录凭据、原始 Token、安装 ID 或敏感精确设备标识。
-- 外部 AI、扫描器和网络服务必须在测试中替换为 fake/mock。
+- 外部 AI 和网络服务必须在测试中替换为 fake/mock。
 
 ## 数据库变更
 

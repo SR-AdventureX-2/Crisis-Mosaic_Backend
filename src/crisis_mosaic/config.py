@@ -145,9 +145,6 @@ class Settings(BaseSettings):
     qiniu_public_base_url: str = "https://cdn-mock.qiniu.local"
     qiniu_upload_token_ttl_seconds: int = 600
     qiniu_callback_url: str = ""
-    malware_scanner: Literal["windows_defender", "fake", "disabled"] = "windows_defender"
-    defender_command: str = ""
-    malware_scan_timeout_seconds: float = 60.0
 
     map_default_latitude: float = 30.2741
     map_default_longitude: float = 120.1551
