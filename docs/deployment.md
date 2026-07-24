@@ -5,10 +5,11 @@
 - Windows 11 或 Windows Server，Python 3.12。
 - 一个可写的本地数据目录。
 - OpenAI-compatible API Key（仅 AI 功能需要）。
-- 真实 Kodo、FCM/APNs 或厂商 Push 凭证仅在接入生产通道时需要；默认使用 Mock。
+- 真实 Kodo、FCM/APNs 或厂商 Push 凭证仅在接入相应通道时需要；媒体和 Push 默认使用
+  Mock，但媒体服务也可为真实七牛 Kodo 签发标准直传 Token。
 
-不使用 Docker、Compose、Redis、Celery 或 PostGIS。默认媒体和 Push 使用 Mock，便于
-单机联调；真实对象存储和 Push provider 仍需要独立凭证、回调和验收。
+不使用 Docker、Compose、Redis、Celery 或 PostGIS。默认 Mock 便于单机联调；真实对象
+存储需要独立凭证和上传验收，真实 Push provider 还需要相应通道凭证和投递验收。
 
 ## 安装与升级
 
@@ -21,7 +22,8 @@ alembic upgrade head
 crisis-mosaic seed
 ```
 
-已有 `.env` 时不要覆盖。部署升级前先备份数据库和上传目录，再执行：
+仓库不会附带或自动生成 `.env`；首次安装需要从模板复制并替换其中的占位密钥。已有
+`.env` 时不要覆盖。部署升级前先备份数据库和上传目录，再执行：
 
 ```powershell
 git pull --ff-only
@@ -85,8 +87,19 @@ provider。分析状态接口会返回 `prompt_sha256`、token 用量、Schema �
 ## 媒体与 Kodo
 
 旧 `/uploads/image-intents` 仍走本地代理图片链路。新版 `/uploads/media-intents` 默认
-使用 `MEDIA_STORAGE_PROVIDER=qiniu_kodo_mock`，返回短期 Upload Token、对象 Key、
-上传 Host、策略快照和可恢复上传会话参数，文件字节不经过业务后端。
+使用 `MEDIA_STORAGE_PROVIDER=qiniu_kodo_mock`。切换为 `qiniu_kodo` 时，后端使用七牛
+标准算法签发短期上传 Token：策略限定 `bucket:object_key`、截止时间和防覆盖约束，策略
+经 URL-safe Base64 后由 SK 做 HMAC-SHA1 签名，最终向客户端返回由 AK、签名和策略拼接
+而成的 Token，以及对象 Key 和上传 Host。SK 不会出现在 API 响应、审计或日志中。
+
+客户端创建媒体意图后的流程为：
+
+1. `client_capabilities.resumable_upload=false`：图片和视频均获得 `KODO_FORM`，以响应中的
+   `token`、`key` 和 `file` 字段向 `QINIU_UPLOAD_HOST` 发送流式 multipart。
+2. `client_capabilities.resumable_upload=true`：图片和视频均获得 `KODO_RESUMABLE_V2`，并
+   通过返回的会话入口维护分片检查点和续签。
+3. 客户端直传完成后调用附件 `complete`；媒体处理就绪后，再用 `attachment_ids` 绑定上报
+   或定向回答。文件字节不经过业务后端。
 
 真实七牛接入时至少配置：
 
@@ -97,12 +110,27 @@ QINIU_SECRET_KEY=...
 QINIU_BUCKET=...
 QINIU_UPLOAD_HOST=https://...
 QINIU_PUBLIC_BASE_URL=https://...
-QINIU_CALLBACK_URL=https://...
+QINIU_UPLOAD_TOKEN_TTL_SECONDS=600
 ```
 
-`QINIU_SECRET_KEY` 只允许留在后端运行环境；不得写入客户端、日志或 API 响应。视频默认
-保持 `ENABLE_VIDEO_UPLOAD=false`，完成真实 Kodo 文件信息校验、扫描、转码和回调验收后
-再开启。
+应用启动时会拒绝缺少 AK、SK、bucket 或绝对 HTTPS `QINIU_UPLOAD_HOST` 的真实 provider
+配置。`QINIU_PUBLIC_BASE_URL` 用于生成媒体访问地址；`QINIU_REGION` 当前不会自动推导
+上传 Host，必须显式配置 bucket 所在区域对应的 Host。`QINIU_SECRET_KEY` 只允许留在后端
+运行环境，不得写入客户端、日志、API 响应或仓库模板。
+
+`QINIU_CALLBACK_URL` 是可选配置；设置后会写入上传策略，但本仓库当前没有七牛回调接收
+路由，必须指向另行部署且可由七牛访问的接收端。当前 `complete` 不调用 Kodo Stat API
+核实对象，远端媒体处理也没有完成真实恶意文件扫描、图片净化、视频转码和回调验收；当前
+媒体访问 URL 还会附加 mock 签名，不具备生产级私有下载鉴权。视频默认保持
+`ENABLE_VIDEO_UPLOAD=false`，只有在这些外部链路完成后才应开启：
+
+```dotenv
+ENABLE_VIDEO_UPLOAD=true
+QINIU_CALLBACK_URL=https://your-callback.example/api/qiniu
+```
+
+上面的地址只是格式示例，不是本仓库提供的端点。真实上线验收至少应覆盖 bucket 写权限、
+区域 Host、Token 过期、防覆盖、对象大小/MIME、回调重试和失败对象清理。
 
 ## Push 通知
 

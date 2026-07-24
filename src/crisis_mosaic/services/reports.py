@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -24,6 +25,7 @@ from ..models import (
 from ..schemas.reports import ReportCreate, ReportLocation
 from ..security import Actor
 from ..utils import as_utc, utcnow
+from .attachments import serialize_attachment
 from .contacts import create_reporter_contact, serialize_contact_masked
 
 
@@ -126,12 +128,15 @@ def serialize_report(
     actor: Actor | None = None,
     *,
     contact: ReporterContact | None = None,
+    attachments: Sequence[Attachment] = (),
 ) -> dict[str, Any]:
     snapshot = report_snapshot(report)
     snapshot.pop("reporter_device_id", None)
     snapshot.pop("reporter_contact_id", None)
     snapshot.pop("manual_priority", None)
     snapshot["reporter"] = serialize_contact_masked(contact)
+    snapshot["attachment_ids"] = [attachment.id for attachment in attachments]
+    snapshot["attachments"] = [serialize_attachment(attachment) for attachment in attachments]
     if actor is not None and not actor.is_resident:
         snapshot["source"] = {
             "type": "anonymous_device",
@@ -188,6 +193,7 @@ async def bind_attachments(
     attachment_ids: list[str],
 ) -> None:
     if not attachment_ids:
+        report.attachment_count = 0
         return
     attachments = list(
         (await session.scalars(select(Attachment).where(Attachment.id.in_(attachment_ids)))).all()
@@ -203,6 +209,7 @@ async def bind_attachments(
             attachment.incident_id != report.incident_id
             or attachment.uploader_device_id != report.reporter_device_id
             or attachment.report_id is not None
+            or attachment.directed_answer_id is not None
             or attachment.metadata_status != "ready"
             or attachment.malware_scan_status not in {"clean", "fake_clean"}
         ):

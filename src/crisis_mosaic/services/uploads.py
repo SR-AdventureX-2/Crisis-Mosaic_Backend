@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import hmac
+import json
 import secrets
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -19,6 +22,7 @@ from ..config import Settings, get_settings
 from ..errors import ApiError
 from ..models import Attachment, BackgroundJob, MediaUploadPart, MediaUploadSession
 from ..utils import sha256_text, utcnow
+from .attachments import attachment_state as attachment_state
 
 ALLOWED_MIME_FORMATS = {
     "image/jpeg": "JPEG",
@@ -32,20 +36,6 @@ SAFE_EXIF_TAGS = {271: "make", 272: "model", 306: "datetime", 36867: "captured_a
 
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=UTC)
-
-
-def attachment_state(attachment: Attachment) -> str:
-    if attachment.rejection_reason:
-        return "rejected"
-    if (
-        attachment.metadata_status == "ready"
-        and attachment.malware_scan_status == "clean"
-        and (attachment.sanitized_path or attachment.object_key)
-    ):
-        return "ready"
-    if attachment.uploaded_at:
-        return "processing"
-    return "pending"
 
 
 def safe_storage_path(root: Path, bucket: str, attachment_id: str, suffix: str) -> Path:
@@ -121,7 +111,38 @@ def _object_suffix(file_name: str, mime_type: str) -> str:
 
 
 def _upload_token(*, attachment_id: str, object_key: str, settings: Settings) -> tuple[str, str]:
-    token = secrets.token_urlsafe(48)
+    if settings.media_storage_provider == "qiniu_kodo":
+        policy: dict[str, int | str] = {
+            "scope": f"{settings.qiniu_bucket}:{object_key}",
+            "deadline": int(
+                (utcnow() + timedelta(seconds=settings.qiniu_upload_token_ttl_seconds)).timestamp()
+            ),
+            "insertOnly": 1,
+        }
+        if settings.qiniu_callback_url:
+            policy.update(
+                {
+                    "callbackUrl": settings.qiniu_callback_url,
+                    "callbackBody": (
+                        "key=$(key)&hash=$(etag)&bucket=$(bucket)&"
+                        "fsize=$(fsize)&mimeType=$(mimeType)"
+                    ),
+                    "callbackBodyType": "application/x-www-form-urlencoded",
+                }
+            )
+        encoded_policy = base64.urlsafe_b64encode(
+            json.dumps(policy, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).decode("ascii")
+        signature = base64.urlsafe_b64encode(
+            hmac.new(
+                settings.qiniu_secret_key.encode("utf-8"),
+                encoded_policy.encode("ascii"),
+                hashlib.sha1,
+            ).digest()
+        ).decode("ascii")
+        token = f"{settings.qiniu_access_key}:{signature}:{encoded_policy}"
+    else:
+        token = secrets.token_urlsafe(48)
     fingerprint = sha256_text(f"{attachment_id}:{object_key}:{token}")[-8:]
     return token, fingerprint
 
@@ -216,7 +237,7 @@ async def create_media_intent(
         object_key=object_key,
         settings=settings,
     )
-    mode = "resumable" if resumable_upload or media_type == "video" else "form"
+    mode = "resumable" if resumable_upload else "form"
     upload: dict[str, object] = {
         "mode": mode,
         "method": "KODO_RESUMABLE_V2" if mode == "resumable" else "KODO_FORM",

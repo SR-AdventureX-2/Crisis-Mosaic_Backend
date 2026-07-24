@@ -603,6 +603,18 @@ def test_openapi_self_hosted_swagger_and_realtime_schema(client: TestClient) -> 
         "type": "http",
         "scheme": "bearer",
     }
+    upload_content = document["paths"]["/api/v1/uploads/{attachment_id}/content"]["put"]
+    assert upload_content["requestBody"] == {
+        "required": True,
+        "description": "Raw file bytes. Content-Type must match the upload intent MIME type.",
+        "content": {"*/*": {"schema": {"type": "string", "format": "binary"}}},
+    }
+    complete_schema = document["paths"]["/api/v1/uploads/{attachment_id}/complete"][
+        "post"
+    ]["requestBody"]["content"]["application/json"]["schema"]
+    assert {"$ref": "#/components/schemas/UploadCompleteRequest"} in complete_schema[
+        "anyOf"
+    ]
     resource_markers = (
         "{incident_id}",
         "{report_id}",

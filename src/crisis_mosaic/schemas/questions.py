@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 CoordinateSystem = Literal["wgs84", "gcj02"]
 Severity = Literal["low", "medium", "high"]
@@ -72,6 +72,14 @@ class DirectedAnswerPut(LocationInput):
     option_id: str = Field(min_length=1, max_length=80)
     revision: int = Field(ge=0)
     answer_text: str | None = Field(default=None, max_length=300)
+    attachment_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("attachment_ids")
+    @classmethod
+    def unique_attachment_ids(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("attachment_ids must not contain duplicates")
+        return value
 
 
 class FragmentCreate(LocationInput):

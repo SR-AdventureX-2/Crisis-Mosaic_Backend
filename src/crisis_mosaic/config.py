@@ -4,6 +4,7 @@ import json
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -66,6 +67,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
     app_name: str = "Crisis Mosaic API"
@@ -225,6 +227,19 @@ class Settings(BaseSettings):
     def validate_security(self) -> Settings:
         if self.app_env in {"staging", "production"} and self.enable_legacy_demo_ai:
             raise ValueError("legacy caller-supplied AI context is dev/test only")
+        if self.media_storage_provider == "qiniu_kodo":
+            required = {
+                "qiniu_access_key": self.qiniu_access_key,
+                "qiniu_secret_key": self.qiniu_secret_key,
+                "qiniu_bucket": self.qiniu_bucket,
+                "qiniu_upload_host": self.qiniu_upload_host,
+            }
+            missing = [name for name, value in required.items() if not value.strip()]
+            if missing:
+                raise ValueError("qiniu_kodo requires: " + ", ".join(missing))
+            upload_host = urlsplit(self.qiniu_upload_host)
+            if upload_host.scheme.lower() != "https" or not upload_host.netloc:
+                raise ValueError("qiniu_upload_host must be an absolute HTTPS URL")
         if self.app_env == "production":
             credentials = {
                 "jwt_secret": (self.jwt_secret, 32, 8),

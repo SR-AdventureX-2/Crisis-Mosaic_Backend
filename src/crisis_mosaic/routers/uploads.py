@@ -20,9 +20,9 @@ from ..schemas.uploads import (
     ResumableSessionRequest,
     UploadCompleteRequest,
 )
+from ..services.attachments import attachment_state, serialize_attachment
 from ..services.events import emit_event, record_audit
 from ..services.uploads import (
-    attachment_state,
     complete_remote_upload,
     create_image_intent,
     create_media_intent,
@@ -45,57 +45,7 @@ def _authorize_attachment(actor: Any, attachment: Attachment, header: str | None
 
 
 def _attachment_payload(attachment: Attachment) -> dict[str, Any]:
-    settings = get_settings()
-    state = attachment_state(attachment)
-    if attachment.storage_provider == "local_proxy":
-        content_url = f"/api/v1/uploads/{attachment.id}/content" if state == "ready" else None
-        thumbnail_url = (
-            f"/api/v1/uploads/{attachment.id}/thumbnail" if state == "ready" else None
-        )
-    else:
-        base = settings.qiniu_public_base_url.rstrip("/")
-        content_url = (
-            f"{base}/{attachment.object_key}?signature=mock&ttl={settings.signed_download_minutes}"
-            if state == "ready" and attachment.object_key
-            else None
-        )
-        thumbnail_url = (
-            f"{base}/{attachment.object_key}.cover.jpg?signature=mock"
-            if state == "ready" and attachment.object_key
-            else None
-        )
-    return {
-        "attachment_id": attachment.id,
-        "incident_id": attachment.incident_id,
-        "report_id": attachment.report_id,
-        "status": state,
-        "media_type": attachment.media_type,
-        "storage_provider": attachment.storage_provider,
-        "object_key": attachment.object_key,
-        "mime_type": attachment.mime_type,
-        "size_bytes": attachment.size_bytes,
-        "sha256": attachment.sha256,
-        "width": attachment.width,
-        "height": attachment.height,
-        "duration_ms": attachment.duration_ms,
-        "processing_progress": attachment.processing_progress,
-        "duplicate_of_attachment_id": attachment.duplicate_of_attachment_id,
-        "source_cluster_id": attachment.source_cluster_id,
-        "metadata_status": attachment.metadata_status,
-        "malware_scan_status": attachment.malware_scan_status,
-        "ocr_status": attachment.ocr_status,
-        "vision_status": attachment.vision_status,
-        "ocr_text": attachment.ocr_text,
-        "vision_summary": attachment.vision_summary,
-        "transcript_status": attachment.transcript_status,
-        "transcode_status": attachment.transcode_status,
-        "keyframe_status": attachment.keyframe_status,
-        "rejection_reason": attachment.rejection_reason,
-        "content_url": content_url,
-        "thumbnail_url": thumbnail_url,
-        "created_at": isoformat(attachment.created_at),
-        "uploaded_at": isoformat(attachment.uploaded_at),
-    }
+    return serialize_attachment(attachment)
 
 
 @router.post("/image-intents", status_code=status.HTTP_201_CREATED)
@@ -207,7 +157,19 @@ async def create_media_upload_intent(
     return success(data, request)
 
 
-@router.put("/{attachment_id}/content", status_code=status.HTTP_204_NO_CONTENT)
+@router.put(
+    "/{attachment_id}/content",
+    status_code=status.HTTP_204_NO_CONTENT,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "description": "Raw file bytes. Content-Type must match the upload intent MIME type.",
+            "content": {
+                "*/*": {"schema": {"type": "string", "format": "binary"}},
+            },
+        },
+    },
+)
 async def upload_content(
     attachment_id: str,
     request: Request,

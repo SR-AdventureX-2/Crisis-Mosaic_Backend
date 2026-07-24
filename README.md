@@ -15,11 +15,12 @@ WebSocket 实时同步和指挥端 Push Outbox。
   bbox 面积限制和 500 点安全上限。
 - 上报人姓名、手机号、紧急联系人和救援备注字段级加密，普通响应只返回脱敏摘要；
   明文读取走独立 reveal API、mock MFA 和审计。
-- 旧本地图片三步上传继续保留；新媒体接口返回 Kodo Mock 直传 Token、对象 Key、
-  可恢复上传会话、分片检查点、续签、取消和完成校验。
+- 旧本地图片三步上传继续保留；新媒体接口支持 Kodo Mock，以及服务端为真实七牛 Kodo
+  签发标准短期直传 Token、对象 Key、表单/可恢复上传会话、分片检查点、续签和完成校验。
 - 本地图片链路仍执行 SHA-256、真实 MIME、Pillow 像素限制、EXIF 净化、
   缩略图、感知哈希和重复来源聚类。
-- 盲区、定向问题、回答历史和结构化冲突自动检测；定向回答不会重复生成上报。
+- 盲区、定向问题、回答历史和结构化冲突自动检测；定向回答不会重复生成上报，并可绑定
+  已完成处理的图片/视频附件。上报创建、读取和更新响应同样返回已绑定附件明细。
 - 多证据人工冲突决策、稳定事实头表和追加式事实版本链。
 - OpenAI-compatible AI：同步上报整理，异步冲突研判和态势简报。
 - SQLite 持久任务、租约重试、Transactional Outbox、通知 Outbox、WebSocket 补发
@@ -44,9 +45,9 @@ Copy-Item .env.example .env
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-当前工作区已经生成本地随机密钥并写入被 Git 忽略的 `.env`。`AI_API_KEY` 有意保持
-为空，填写兼容服务的 Key 后才会启用真实 AI；未配置时核心业务正常运行，AI 接口返回
-明确的 `503 AI_SERVICE_UNAVAILABLE`。
+仓库只提供 `.env.example`，不会预先生成 `.env`。复制模板后必须自行生成并填写本地随机
+密钥；模板中的 `AI_API_KEY` 保持为空，填写兼容服务的 Key 后才会启用真实 AI。未配置时
+核心业务正常运行，AI 接口返回明确的 `503 AI_SERVICE_UNAVAILABLE`。
 
 初始化数据库并写入幂等演示数据：
 
@@ -130,9 +131,25 @@ X-Incident-Id: <incident-uuid>
 图片采用三步协议：创建上传意图、向返回的 `upload_url` 发送原始二进制 `PUT`、调用
 `complete`。完成请求会校验哈希并进入处理队列进行 MIME、像素与 EXIF 净化。
 
-新版媒体接口使用 `/uploads/media-intents`。服务端返回短期 Kodo Mock Upload Token、
-单对象 Key、技术策略快照和上传模式；客户端文件字节不经过业务后端。视频上传默认由
-`ENABLE_VIDEO_UPLOAD=false` 关闭，打开前应完成真实 Kodo、扫描和转码验收。
+新版媒体接口使用 `/uploads/media-intents`。默认 `qiniu_kodo_mock` 返回 Mock Token；设置
+`MEDIA_STORAGE_PROVIDER=qiniu_kodo` 后，服务端按七牛上传策略生成包含 bucket/object key
+作用域、截止时间和防覆盖约束的标准短期 Token。AK 仅作为标准 Token 的组成部分返回，
+SK 不下发给客户端。客户端声明
+`client_capabilities.resumable_upload=false` 时，图片和视频均返回 `KODO_FORM`，以
+`token`、`key` 和 `file` multipart 字段直传；为 `true` 时返回
+`KODO_RESUMABLE_V2` 和可恢复会话入口。文件字节不经过业务后端。
+
+媒体完成处理后才能绑定业务资源。上报创建和 PATCH 使用 `attachment_ids`；PATCH 省略该
+字段时保留现有绑定，显式列表替换，空列表清除。定向回答 PUT 也接受 `attachment_ids`，
+该列表代表本次回答的完整附件集合。附件必须属于同一事件和当前居民设备、处于 ready/clean
+状态且尚未绑定其他上报或回答。上报响应、回答响应和居民活动问题中的 `my_answer` 均返回
+`attachment_ids` 与 `attachments` 明细。
+
+视频上传默认由 `ENABLE_VIDEO_UPLOAD=false` 关闭。当前真实 Kodo 集成只负责标准 Token
+签发和客户端直传合同；尚未实现服务端 Kodo Stat 校验、七牛回调接收端，以及真实恶意
+文件扫描、视频转码和验收，完成接口也不会主动向七牛查询对象；媒体访问 URL 仍使用 mock
+签名。因此启用视频或用于生产前仍需完成这些外部集成检查。部署配置见
+[单机部署与运维](docs/deployment.md#媒体与-kodo)。
 
 WebSocket 地址为 `ws://127.0.0.1:8000/api/v1/realtime`。连接后 5 秒内发送：
 
@@ -205,8 +222,8 @@ AI_BRIEF_MODEL=gpt-4.1-mini
 `GET /api/v1/ai/analyses/{analysis_id}` 会返回 `prompt_sha256`、`input_tokens`、
 `output_tokens`、`schema_valid` 和 `reference_valid`，用于审计结构化输出和引用校验。
 
-当前 Flutter 演示使用的 `context.evidence` 同步冲突请求仅在
-`ENABLE_LEGACY_DEMO_AI=true` 时启用。正式请求始终从数据库读取当前完整证据并返回
+调用方传入 `context.evidence` 的旧同步冲突请求仅在 `ENABLE_LEGACY_DEMO_AI=true` 时
+启用。正式请求始终从数据库读取当前完整证据并返回
 `202 + analysis_id + status_url`。
 
 ## 验证
@@ -218,8 +235,9 @@ python -m mypy src\crisis_mosaic
 alembic check
 ```
 
-真实 AI Key、真实 Kodo 和真实 Push provider 属于可选本机集成检查；
-常规测试使用 fake AI、Kodo Mock 和 Push Mock，不依赖外部服务。
+真实 AI Key、真实 Kodo 上传和真实 Push provider 属于可选集成检查。常规测试使用 fake
+AI、Kodo Mock 和 Push Mock，并使用测试凭证验证真实 Kodo Token 的本地签名合同，不向
+第三方服务发送请求。
 
 更多说明：
 

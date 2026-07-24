@@ -1,31 +1,40 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from datetime import timedelta
 from typing import Any
 
+import httpx
 import pytest
-from fastapi import Request
+from fastapi import FastAPI, Request
 from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from crisis_mosaic.errors import ApiError
+from crisis_mosaic.dependencies import get_actor
+from crisis_mosaic.errors import ApiError, install_error_handlers
 from crisis_mosaic.models import (
     AnonymousDevice,
+    Attachment,
     Base,
     Incident,
     MapFeature,
+    Report,
     ReportRevision,
 )
 from crisis_mosaic.routers.map import map_view
+from crisis_mosaic.routers.reports import router as reports_router
 from crisis_mosaic.schemas.reports import ReportCreate, ReportLocation, ReportPatch
 from crisis_mosaic.security import Actor
+from crisis_mosaic.services.attachments import attachments_by_report
 from crisis_mosaic.services.idempotency import finish, replay_or_reserve
 from crisis_mosaic.services.reports import (
     apply_location,
     assert_report_access,
     create_report,
 )
+from crisis_mosaic.utils import utcnow
 
 
 async def _database() -> tuple[Any, async_sessionmaker[Any]]:
@@ -87,6 +96,129 @@ def test_patch_uses_model_fields_set_to_distinguish_omitted_and_null() -> None:
 
     assert "ai_refinement_id" not in omitted.model_fields_set
     assert "ai_refinement_id" in explicit_null.model_fields_set
+
+
+def test_report_responses_include_attachments_and_patch_replaces_explicitly() -> None:
+    async def scenario() -> None:
+        engine, factory = await _database()
+        try:
+            async with factory() as session:
+                async with session.begin():
+                    incident, device, actor = await _seed(session)
+                    first_attachment = Attachment(
+                        id="report-attachment-1",
+                        incident_id=incident.id,
+                        uploader_device_id=device.id,
+                        file_name="first.jpg",
+                        declared_mime_type="image/jpeg",
+                        mime_type="image/jpeg",
+                        size_bytes=100,
+                        expected_sha256="1" * 64,
+                        sha256="1" * 64,
+                        sanitized_path="C:/safe/first.jpg",
+                        metadata_status="ready",
+                        malware_scan_status="clean",
+                        upload_expires_at=utcnow() + timedelta(hours=1),
+                        uploaded_at=utcnow(),
+                    )
+                    second_attachment = Attachment(
+                        id="report-attachment-2",
+                        incident_id=incident.id,
+                        uploader_device_id=device.id,
+                        file_name="second.jpg",
+                        declared_mime_type="image/jpeg",
+                        mime_type="image/jpeg",
+                        size_bytes=200,
+                        expected_sha256="2" * 64,
+                        sha256="2" * 64,
+                        sanitized_path="C:/safe/second.jpg",
+                        metadata_status="ready",
+                        malware_scan_status="clean",
+                        upload_expires_at=utcnow() + timedelta(hours=1),
+                        uploaded_at=utcnow(),
+                    )
+                    session.add_all([first_attachment, second_attachment])
+                    report = await create_report(
+                        session,
+                        incident=incident,
+                        actor=actor,
+                        payload=ReportCreate(
+                            category="road",
+                            reporter=_reporter(),
+                            content_original="Road is flooded",
+                            location={"text": "Daguan Bridge"},
+                            attachment_ids=[first_attachment.id],
+                        ),
+                    )
+                    report_id = report.id
+                    incident_id = incident.id
+
+            async def session_override() -> AsyncIterator[Any]:
+                async with factory() as session:
+                    yield session
+
+            async def actor_override() -> Actor:
+                return actor
+
+            from crisis_mosaic.db import get_session
+
+            app = FastAPI()
+            install_error_handlers(app)
+            app.include_router(reports_router, prefix="/api/v1")
+            app.dependency_overrides[get_actor] = actor_override
+            app.dependency_overrides[get_session] = session_override
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.get(
+                    f"/api/v1/reports/{report_id}",
+                    headers={"X-Incident-Id": incident_id},
+                )
+                assert response.status_code == 200, response.text
+                data = response.json()["data"]
+                assert data["attachment_ids"] == ["report-attachment-1"]
+                assert data["attachments"][0]["report_id"] == report_id
+                assert data["attachments"][0]["directed_answer_id"] is None
+                assert data["attachments"][0]["content_url"].endswith(
+                    "/report-attachment-1/content"
+                )
+
+                omitted = await client.patch(
+                    f"/api/v1/reports/{report_id}",
+                    headers={"X-Incident-Id": incident_id},
+                    json={"revision": 1, "content_original": "Road remains flooded"},
+                )
+                assert omitted.status_code == 200, omitted.text
+                assert omitted.json()["data"]["attachment_ids"] == ["report-attachment-1"]
+
+                replaced = await client.patch(
+                    f"/api/v1/reports/{report_id}",
+                    headers={"X-Incident-Id": incident_id},
+                    json={"revision": 2, "attachment_ids": ["report-attachment-2"]},
+                )
+                assert replaced.status_code == 200, replaced.text
+                assert replaced.json()["data"]["attachment_ids"] == ["report-attachment-2"]
+
+                cleared = await client.patch(
+                    f"/api/v1/reports/{report_id}",
+                    headers={"X-Incident-Id": incident_id},
+                    json={"revision": 3, "attachment_ids": []},
+                )
+                assert cleared.status_code == 200, cleared.text
+                assert cleared.json()["data"]["attachment_ids"] == []
+                assert cleared.json()["data"]["attachment_count"] == 0
+
+            async with factory() as session:
+                attachment_map = await attachments_by_report(session, [report_id])
+                assert attachment_map[report_id] == []
+                assert (await session.get(Attachment, "report-attachment-1")).report_id is None
+                assert (await session.get(Attachment, "report-attachment-2")).report_id is None
+                stored_report = await session.get(Report, report_id)
+                assert stored_report is not None
+                assert stored_report.attachment_count == 0
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
 
 
 def test_gps_location_requires_accuracy() -> None:

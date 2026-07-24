@@ -17,8 +17,8 @@
 - 主键使用 UUIDv7 字符串；时间按 UTC 写入，API 输出 `Z` 后缀。
 - JSON 保存为 SQLite JSON/TEXT；位置保存原始值、WGS84 和 GCJ-02 投影。
 - 范围检索使用 bbox、Haversine 和应用层几何逻辑，不冒充 PostGIS。
-- 旧图片代理链路保存在 `data/uploads` 的隔离目录；新媒体链路签发 Kodo Mock
-  上传凭证并只保存对象 Key、会话和处理状态。
+- 旧图片代理链路保存在 `data/uploads` 的隔离目录；新媒体链路支持 Kodo Mock，也可用
+  服务端 AK/SK 为真实七牛 Kodo 签发标准短期 Token，并只保存对象 Key、会话和处理状态。
 - 持久任务、业务 Outbox 和通知 Outbox 保存在 SQLite；WebSocket 连接中心仅驻留当前
   进程。
 
@@ -31,7 +31,11 @@
   字段级加密，普通响应只返回脱敏形式。明文 reveal 只允许 admin + mock MFA，并写审计。
 - PATCH 省略字段表示保留；显式 `null` 仅清除允许为空的字段；位置对象整体替换。
 - 紧急上报固定为 `high/urgent_flag`；其余按人工覆盖、有效 AI 建议、类别默认值排序。
-- 定向回答只更新回答和信息碎片，不额外生成上报。
+- 定向回答只更新回答和信息碎片，不额外生成上报；PUT 可用 `attachment_ids` 替换绑定的
+  ready/clean 附件，回答响应和居民活动问题中的 `my_answer` 返回附件 ID 与明细。
+- 上报创建可绑定 ready/clean 附件；PATCH 省略 `attachment_ids` 时保留、显式列表替换、
+  空列表清除。上报创建、列表、详情、最近上报和更新响应返回附件 ID 与明细。同一附件
+  不能同时绑定上报和定向回答，且必须属于同一事件和居民设备。
 - 默认两个一致有效回答关闭盲区；大关桥种子场景覆盖为一个；`unknown` 不计数。
 - 自动冲突检测只处理有 `claim_key/claim_value` 的结构化事实；自由文本由人工创建冲突。
 - 人工决策必须覆盖当前完整证据，并在一个事务内更新冲突、证据处置、事实版本、地图、
@@ -39,8 +43,10 @@
 - 指挥角色读取授权精度坐标；居民地图中他人上报约 100m 模糊化，不返回设备 ID、
   精确地址或 Token。单次最多 500 个点，bbox 还受配置面积上限约束，任一超限均返回
   `MAP_VIEW_TOO_LARGE`。
-- `/uploads/media-intents` 返回 Kodo Mock 上传策略、对象 Key 和可恢复上传会话；
-  API 不代理新媒体文件字节，也不下发 AK/SK。视频仍由 `ENABLE_VIDEO_UPLOAD` 控制。
+- `/uploads/media-intents` 按 provider 返回 Mock Token 或真实七牛标准短期 Token、对象 Key
+  和上传模式；客户端不支持可恢复上传时，图片/视频均使用 `KODO_FORM`，支持时均使用
+  `KODO_RESUMABLE_V2`。API 不代理新媒体文件字节，也不下发 SK；视频仍由
+  `ENABLE_VIDEO_UPLOAD` 控制。
 - 指挥端 Push 使用设备注册、个人偏好、通知 Outbox、Mock provider 投递和回执记录；
   业务事务不直接调用第三方服务。
 - AI 上报整理同步执行；正式冲突分析和态势简报异步执行。AI 输出必须通过 Schema、
@@ -58,7 +64,7 @@
 | 并发 | 单进程、单 worker | 不满足 200 写请求/秒 |
 | 实时 | 内存连接中心、SQLite 回放 | 不满足 20,000 长连接或跨实例广播 |
 | 可用性 | 本机重启恢复任务和 Outbox | 不满足 99.9%、多可用区、自动故障转移 |
-| 存储 | 旧本地图片 + Kodo Mock 对象 Key | 不等价于真实七牛 Kodo SLA、回调或配额 |
+| 存储 | 旧本地图片 + Kodo Mock/真实 Token 签发与对象 Key | 未实现 Kodo Stat、回调接收、真实扫描/转码验收或生产级私有下载鉴权，不声明七牛 SLA 或配额能力 |
 | 身份 | 本地账号、JWT、mock MFA code | 不提供 OIDC、真实 MFA 或企业目录 |
 | 密钥 | 本地 `.env` 派生字段密钥 | 不等价于 KMS 信封加密或密钥轮换 |
 | Push | SQLite Outbox + Mock provider | 不等价于 APNs/FCM/厂商通道送达能力 |
@@ -68,6 +74,7 @@
 
 ## 前端边界
 
-本次只修改后端。当前 Flutter 前端只有冲突分析使用远程 API；居民上报、定向回答、
-指挥简报和实时同步仍需后续前端适配，才能从本地状态迁移到这些 REST/WebSocket 接口。
-本仓库不会把 Swagger UI 描述为产品 AI 页面。
+Flutter 客户端对接不再限定为“仅冲突分析”；本后端已提供登录会话、居民上报及附件、
+定向回答及附件、地图、指挥简报、冲突分析和实时同步合同。具体客户端覆盖情况应以当前
+Flutter 代码和 OpenAPI 为准，本文件不再把这些能力描述为尚未适配。本仓库中的 Swagger
+UI 仍只用于 API 文档、鉴权和调试，不是产品 AI 页面。

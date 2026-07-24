@@ -279,6 +279,75 @@ def test_non_production_keeps_local_defaults_available() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "missing_field",
+    ["qiniu_access_key", "qiniu_secret_key", "qiniu_bucket", "qiniu_upload_host"],
+)
+def test_real_qiniu_provider_requires_server_side_configuration(missing_field: str) -> None:
+    values = {
+        "app_env": "test",
+        "media_storage_provider": "qiniu_kodo",
+        "qiniu_access_key": "test-qiniu-access-key",
+        "qiniu_secret_key": "test-qiniu-secret-key",
+        "qiniu_bucket": "test-bucket",
+        "qiniu_upload_host": "https://upload.qiniup.com",
+    }
+    values[missing_field] = ""
+    with pytest.raises(ValidationError, match=missing_field):
+        Settings(**values)
+
+
+@pytest.mark.parametrize("upload_host", ["http://upload.qiniup.com", "upload.qiniup.com"])
+def test_real_qiniu_provider_requires_https_upload_host(upload_host: str) -> None:
+    with pytest.raises(ValidationError, match="absolute HTTPS URL"):
+        Settings(
+            app_env="test",
+            media_storage_provider="qiniu_kodo",
+            qiniu_access_key="test-qiniu-access-key",
+            qiniu_secret_key="test-qiniu-secret-key",
+            qiniu_bucket="test-bucket",
+            qiniu_upload_host=upload_host,
+        )
+
+
+def test_real_qiniu_provider_accepts_complete_https_configuration() -> None:
+    settings = Settings(
+        app_env="test",
+        media_storage_provider="qiniu_kodo",
+        qiniu_access_key="test-qiniu-access-key",
+        qiniu_secret_key="test-qiniu-secret-key",
+        qiniu_bucket="test-bucket",
+        qiniu_upload_host="https://upload.qiniup.com",
+    )
+    assert settings.media_storage_provider == "qiniu_kodo"
+
+
+def test_qiniu_configuration_errors_do_not_expose_secret_key() -> None:
+    secret_key = "server-only-test-qiniu-secret"
+    with pytest.raises(ValidationError) as error:
+        Settings(
+            app_env="test",
+            media_storage_provider="qiniu_kodo",
+            qiniu_access_key="test-qiniu-access-key",
+            qiniu_secret_key=secret_key,
+            qiniu_bucket="test-bucket",
+            qiniu_upload_host="http://upload.qiniup.com",
+        )
+    if secret_key in str(error.value):
+        raise AssertionError("configuration validation exposed qiniu_secret_key")
+
+
+def test_env_template_does_not_embed_ai_api_key() -> None:
+    template = Path(__file__).resolve().parents[1] / ".env.example"
+    value = next(
+        line.partition("=")[2]
+        for line in template.read_text(encoding="utf-8").splitlines()
+        if line.startswith("AI_API_KEY=")
+    )
+    if value:
+        raise AssertionError("AI_API_KEY must be empty in .env.example")
+
+
 def test_production_accepts_independent_strong_credentials() -> None:
     assert _production_settings().app_env == "production"
 

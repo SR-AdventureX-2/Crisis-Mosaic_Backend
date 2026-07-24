@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -246,6 +250,112 @@ async def test_media_intent_resumable_parts_and_mock_processing(
         assert attachment.metadata_status == "ready"
         assert attachment.malware_scan_status == "clean"
         assert attachment.object_key is not None
+
+
+@pytest.mark.parametrize(
+    ("media_type", "resumable_upload", "expected_method"),
+    [
+        ("image", False, "KODO_FORM"),
+        ("video", False, "KODO_FORM"),
+        ("image", True, "KODO_RESUMABLE_V2"),
+        ("video", True, "KODO_RESUMABLE_V2"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_media_intent_honors_resumable_capability_for_images_and_videos(
+    session_maker: async_sessionmaker[AsyncSession],
+    media_type: str,
+    resumable_upload: bool,
+    expected_method: str,
+) -> None:
+    settings = Settings(
+        app_env="test",
+        enable_video_upload=True,
+        media_storage_provider="qiniu_kodo_mock",
+        qiniu_bucket="test-bucket",
+    )
+    mime_type = "video/mp4" if media_type == "video" else "image/jpeg"
+    async with session_maker() as session:
+        incident, device = await _seed_incident_device(session)
+        _, intent, _ = await create_media_intent(
+            session,
+            incident_id=incident.id,
+            uploader_device_id=device.id,
+            media_type=media_type,
+            client_source="camera",
+            file_name=f"evidence.{'mp4' if media_type == 'video' else 'jpg'}",
+            mime_type=mime_type,
+            size_bytes=128,
+            expected_sha256="b" * 64,
+            duration_ms=1_000 if media_type == "video" else None,
+            resumable_upload=resumable_upload,
+            settings=settings,
+        )
+
+    upload = intent["upload"]
+    assert upload["method"] == expected_method
+    assert upload["mode"] == ("resumable" if resumable_upload else "form")
+    if resumable_upload:
+        assert "session_endpoint" in upload
+        assert "form_field" not in upload
+    else:
+        assert upload["form_field"] == "file"
+        assert "session_endpoint" not in upload
+
+
+@pytest.mark.asyncio
+async def test_real_qiniu_intent_uses_standard_signed_upload_policy(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    access_key = "test-qiniu-access-key"
+    secret_key = "test-qiniu-secret-key"
+    settings = Settings(
+        app_env="test",
+        media_storage_provider="qiniu_kodo",
+        qiniu_access_key=access_key,
+        qiniu_secret_key=secret_key,
+        qiniu_bucket="test-bucket",
+        qiniu_upload_host="https://upload.qiniup.com",
+        qiniu_callback_url="https://api.example.test/qiniu/callback",
+    )
+    before = int(datetime.now(UTC).timestamp())
+    async with session_maker() as session:
+        incident, device = await _seed_incident_device(session)
+        attachment, intent, token_fingerprint = await create_media_intent(
+            session,
+            incident_id=incident.id,
+            uploader_device_id=device.id,
+            media_type="image",
+            client_source="gallery",
+            file_name="evidence.jpg",
+            mime_type="image/jpeg",
+            size_bytes=128,
+            expected_sha256="c" * 64,
+            duration_ms=None,
+            resumable_upload=False,
+            settings=settings,
+        )
+
+    token = str(intent["upload"]["fields"]["token"])
+    token_access_key, signature, encoded_policy = token.split(":", 2)
+    expected_signature = base64.urlsafe_b64encode(
+        hmac.new(
+            secret_key.encode("utf-8"),
+            encoded_policy.encode("ascii"),
+            hashlib.sha1,
+        ).digest()
+    ).decode("ascii")
+    policy = json.loads(base64.urlsafe_b64decode(encoded_policy).decode("utf-8"))
+
+    assert token_access_key == access_key
+    assert hmac.compare_digest(signature, expected_signature)
+    assert policy["scope"] == f"test-bucket:{attachment.object_key}"
+    assert policy["insertOnly"] == 1
+    assert before < policy["deadline"] <= before + settings.qiniu_upload_token_ttl_seconds + 1
+    assert policy["callbackUrl"] == settings.qiniu_callback_url
+    assert intent["upload"]["method"] == "KODO_FORM"
+    assert secret_key not in str(intent)
+    assert len(token_fingerprint) == 8
 
 
 @pytest.mark.asyncio

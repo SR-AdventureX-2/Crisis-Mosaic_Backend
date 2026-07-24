@@ -25,6 +25,7 @@ from ..schemas.reports import (
     ReportStatus,
     ReportStatusPatch,
 )
+from ..services.attachments import attachments_by_report
 from ..services.contacts import (
     authorize_reveal,
     serialize_contact_plain,
@@ -108,11 +109,7 @@ async def _contacts_for_reports(
     if not ids:
         return {}
     rows = list(
-        (
-            await session.scalars(
-                select(ReporterContact).where(ReporterContact.id.in_(ids))
-            )
-        ).all()
+        (await session.scalars(select(ReporterContact).where(ReporterContact.id.in_(ids)))).all()
     )
     return {row.id: row for row in rows}
 
@@ -205,6 +202,7 @@ async def post_report(
                 payload=payload,
             )
             contact = await _contact_for_report(session, report)
+            attachments = (await attachments_by_report(session, [report.id])).get(report.id, [])
             await record_audit(
                 session,
                 actor=actor,
@@ -224,7 +222,7 @@ async def post_report(
                 resource_revision=report.revision,
                 visibility="owner",
                 owner_device_id=report.reporter_device_id,
-                payload=serialize_report(report, contact=contact),
+                payload=serialize_report(report, contact=contact, attachments=attachments),
             )
             notification_event_type = (
                 "urgent_report.created" if report.is_urgent else "report.created"
@@ -242,7 +240,10 @@ async def post_report(
                 title="Crisis Mosaic 紧急提醒",
                 body="收到一条新的高优先级现场上报，请打开应用查看。",
             )
-            response = success(serialize_report(report, actor, contact=contact), request)
+            response = success(
+                serialize_report(report, actor, contact=contact, attachments=attachments),
+                request,
+            )
             finish(reservation, status_code=201, body=response)
             return response
 
@@ -305,6 +306,7 @@ async def list_reports(
     has_more = len(reports) > limit
     page = reports[:limit]
     contacts = await _contacts_for_reports(session, page)
+    attachment_map = await attachments_by_report(session, [item.id for item in page])
     next_cursor = encode_cursor(page[-1]) if has_more and page else None
     return success(
         [
@@ -312,6 +314,7 @@ async def list_reports(
                 item,
                 actor,
                 contact=contacts.get(item.reporter_contact_id or ""),
+                attachments=attachment_map.get(item.id, []),
             )
             for item in page
         ],
@@ -339,7 +342,11 @@ async def read_report(
     incident = await _incident_for_report(session, report)
     assert_incident_access(actor, incident, incident_header)
     contact = await _contact_for_report(session, report)
-    return success(serialize_report(report, actor, contact=contact), request)
+    attachments = (await attachments_by_report(session, [report.id])).get(report.id, [])
+    return success(
+        serialize_report(report, actor, contact=contact, attachments=attachments),
+        request,
+    )
 
 
 @router.get("/reports/{report_id}/history")
@@ -506,6 +513,7 @@ async def patch_report(
                 before=before,
                 after=snapshot,
             )
+            attachments = (await attachments_by_report(session, [report.id])).get(report.id, [])
             await emit_event(
                 session,
                 incident=incident,
@@ -518,10 +526,14 @@ async def patch_report(
                 payload=serialize_report(
                     report,
                     contact=await _contact_for_report(session, report),
+                    attachments=attachments,
                 ),
             )
             contact = await _contact_for_report(session, report)
-            return success(serialize_report(report, actor, contact=contact), request)
+            return success(
+                serialize_report(report, actor, contact=contact, attachments=attachments),
+                request,
+            )
 
 
 @router.get("/me/reports/recent")
@@ -548,7 +560,8 @@ async def recent_report(
     if report is None:
         return success(None, request)
     contact = await _contact_for_report(session, report)
-    data = serialize_report(report, actor, contact=contact)
+    attachments = (await attachments_by_report(session, [report.id])).get(report.id, [])
+    data = serialize_report(report, actor, contact=contact, attachments=attachments)
     if contact is not None:
         data["reporter"] = serialize_contact_plain(contact)
     response.headers["Cache-Control"] = "no-store"
@@ -684,6 +697,7 @@ async def patch_report_status(
                 after=snapshot,
                 metadata={"note": payload.note},
             )
+            attachments = (await attachments_by_report(session, [report.id])).get(report.id, [])
             event = await emit_event(
                 session,
                 incident=incident,
@@ -696,6 +710,7 @@ async def patch_report_status(
                 payload=serialize_report(
                     report,
                     contact=await _contact_for_report(session, report),
+                    attachments=attachments,
                 ),
             )
             await enqueue_operator_notifications(
@@ -712,7 +727,10 @@ async def patch_report_status(
                 body="一条现场上报状态已更新，请打开应用查看。",
             )
             contact = await _contact_for_report(session, report)
-            return success(serialize_report(report, actor, contact=contact), request)
+            return success(
+                serialize_report(report, actor, contact=contact, attachments=attachments),
+                request,
+            )
 
 
 @router.patch("/reports/{report_id}/priority")
@@ -785,6 +803,7 @@ async def patch_report_priority(
                 after=snapshot,
                 metadata={"note": payload.note},
             )
+            attachments = (await attachments_by_report(session, [report.id])).get(report.id, [])
             event = await emit_event(
                 session,
                 incident=incident,
@@ -797,6 +816,7 @@ async def patch_report_priority(
                 payload=serialize_report(
                     report,
                     contact=await _contact_for_report(session, report),
+                    attachments=attachments,
                 ),
             )
             await enqueue_operator_notifications(
@@ -813,4 +833,7 @@ async def patch_report_priority(
                 body="一条现场上报优先级已更新，请打开应用查看。",
             )
             contact = await _contact_for_report(session, report)
-            return success(serialize_report(report, actor, contact=contact), request)
+            return success(
+                serialize_report(report, actor, contact=contact, attachments=attachments),
+                request,
+            )

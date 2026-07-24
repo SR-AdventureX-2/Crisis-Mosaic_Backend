@@ -100,9 +100,7 @@ class ReporterContact(Base, IdMixin, TimestampMixin):
     __tablename__ = "reporter_contacts"
 
     incident_id: Mapped[str] = mapped_column(ForeignKey("incidents.id"), index=True)
-    resident_device_id: Mapped[str] = mapped_column(
-        ForeignKey("anonymous_devices.id"), index=True
-    )
+    resident_device_id: Mapped[str] = mapped_column(ForeignKey("anonymous_devices.id"), index=True)
     full_name_ciphertext: Mapped[str] = mapped_column(Text)
     full_name_masked: Mapped[str] = mapped_column(String(100))
     mobile_ciphertext: Mapped[str] = mapped_column(Text)
@@ -205,6 +203,9 @@ class Attachment(Base, IdMixin):
 
     incident_id: Mapped[str] = mapped_column(ForeignKey("incidents.id"), index=True)
     report_id: Mapped[str | None] = mapped_column(ForeignKey("reports.id"), index=True)
+    directed_answer_id: Mapped[str | None] = mapped_column(
+        ForeignKey("directed_answers.id", ondelete="SET NULL"), index=True
+    )
     uploader_device_id: Mapped[str] = mapped_column(ForeignKey("anonymous_devices.id"))
     file_name: Mapped[str] = mapped_column(String(255))
     declared_mime_type: Mapped[str] = mapped_column(String(80))
