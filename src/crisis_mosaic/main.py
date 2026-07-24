@@ -174,6 +174,7 @@ def create_app() -> FastAPI:
         reports.router,
         map.router,
         uploads.router,
+        uploads.callback_router,
         notifications.router,
         questions.router,
         conflicts.router,

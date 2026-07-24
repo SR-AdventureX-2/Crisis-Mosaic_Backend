@@ -147,6 +147,7 @@ class Settings(BaseSettings):
     qiniu_public_base_url: str = "https://cdn-mock.qiniu.local"
     qiniu_upload_token_ttl_seconds: int = 600
     qiniu_callback_url: str = ""
+    qiniu_rs_host: str = "https://rs.qiniuapi.com"
 
     map_default_latitude: float = 30.2741
     map_default_longitude: float = 120.1551

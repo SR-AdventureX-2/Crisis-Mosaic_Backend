@@ -1965,6 +1965,8 @@ async def enrich_attachment(
     session: AsyncSession,
     attachment: Attachment,
     settings: Settings | None = None,
+    *,
+    image_bytes: bytes | None = None,
 ) -> None:
     settings = settings or get_settings()
     if not settings.ai_configured:
@@ -1977,12 +1979,14 @@ async def enrich_attachment(
         attachment.vision_status = "succeeded"
         attachment.vision_summary = "测试图片已安全解码，未配置真实视觉内容。"
         return
-    if not attachment.sanitized_path:
+    if image_bytes is None and not attachment.sanitized_path:
         attachment.ocr_status = "failed"
         attachment.vision_status = "failed"
         return
     try:
-        image_bytes = await asyncio.to_thread(Path(attachment.sanitized_path).read_bytes)
+        if image_bytes is None:
+            assert attachment.sanitized_path is not None
+            image_bytes = await asyncio.to_thread(Path(attachment.sanitized_path).read_bytes)
         invocation = await _invoke_structured(
             purpose="attachment_enrichment",
             payload={

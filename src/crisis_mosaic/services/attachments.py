@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import get_settings
 from ..models import Attachment
 from ..utils import isoformat
+from .qiniu import sign_download_url
 
 
 def attachment_state(attachment: Attachment) -> str:
@@ -31,6 +32,26 @@ def serialize_attachment(attachment: Attachment) -> dict[str, Any]:
     if attachment.storage_provider == "local_proxy":
         content_url = f"/api/v1/uploads/{attachment.id}/content" if state == "ready" else None
         thumbnail_url = f"/api/v1/uploads/{attachment.id}/thumbnail" if state == "ready" else None
+    elif attachment.storage_provider == "qiniu_kodo":
+        content_url = None
+        thumbnail_url = None
+        if state == "ready" and attachment.object_key:
+            base = settings.qiniu_public_base_url.rstrip("/")
+            ttl_seconds = settings.signed_download_minutes * 60
+            if attachment.media_type == "video":
+                thumbnail_raw = f"{base}/{attachment.object_key}?vframe/jpg/offset/1"
+            else:
+                thumbnail_raw = f"{base}/{attachment.object_key}?imageView2/2/w/640/h/640"
+            content_url = sign_download_url(
+                f"{base}/{attachment.object_key}",
+                ttl_seconds=ttl_seconds,
+                settings=settings,
+            )
+            thumbnail_url = sign_download_url(
+                thumbnail_raw,
+                ttl_seconds=ttl_seconds,
+                settings=settings,
+            )
     else:
         base = settings.qiniu_public_base_url.rstrip("/")
         content_url = (

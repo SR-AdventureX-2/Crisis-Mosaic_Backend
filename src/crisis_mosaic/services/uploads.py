@@ -23,6 +23,7 @@ from ..errors import ApiError
 from ..models import Attachment, BackgroundJob, MediaUploadPart, MediaUploadSession
 from ..utils import sha256_text, utcnow
 from .attachments import attachment_state as attachment_state
+from .qiniu import fetch_object_bytes, stat_object
 
 ALLOWED_MIME_FORMATS = {
     "image/jpeg": "JPEG",
@@ -497,25 +498,67 @@ async def process_remote_media(
         raise ApiError(404, "ATTACHMENT_NOT_FOUND", "附件不存在")
     if not attachment.uploaded_at or not attachment.object_key:
         raise ApiError(409, "UPLOAD_NOT_FINISHED", "上传尚未完成")
-    attachment.mime_type = attachment.declared_mime_type
+    is_real_kodo = attachment.storage_provider == "qiniu_kodo"
+    if is_real_kodo:
+        # Verify the object truly exists in Kodo and adopt its real metadata.
+        stat = await stat_object(attachment.object_key, settings)
+        remote_size = int(stat.get("fsize") or 0)
+        if remote_size != attachment.size_bytes:
+            attachment.metadata_status = "rejected"
+            attachment.rejection_reason = "UPLOAD_SIZE_MISMATCH"
+            raise ApiError(
+                422,
+                "UPLOAD_SIZE_MISMATCH",
+                "七牛云对象大小与上传声明不一致",
+                details={"declared": attachment.size_bytes, "actual": remote_size},
+            )
+        attachment.etag = str(stat.get("hash") or attachment.etag or "") or None
+        attachment.mime_type = str(stat.get("mimeType") or attachment.declared_mime_type)
+    else:
+        attachment.mime_type = attachment.declared_mime_type
     attachment.malware_scan_status = "clean"
     attachment.metadata_status = "ready"
     attachment.processing_progress = 100
     attachment.rejection_reason = None
+    public_base = settings.qiniu_public_base_url.rstrip("/")
     if attachment.media_type == "image":
         attachment.ocr_status = "unavailable"
         attachment.vision_status = "unavailable"
-        attachment.vision_summary = "Mock Kodo image processing completed"
+        if is_real_kodo:
+            attachment.vision_summary = None
+            # OCR/vision remain degradable: enrichment failure never rejects evidence.
+            try:
+                image_bytes = await fetch_object_bytes(
+                    attachment.object_key,
+                    max_bytes=settings.max_image_bytes,
+                    settings=settings,
+                )
+                actual_sha256 = hashlib.sha256(image_bytes).hexdigest()
+                if actual_sha256 != attachment.expected_sha256:
+                    raise ApiError(422, "UPLOAD_HASH_MISMATCH", "七牛云对象哈希与声明不一致")
+                from .ai import enrich_attachment
+
+                await enrich_attachment(session, attachment, settings, image_bytes=image_bytes)
+            except Exception as exc:
+                attachment.ocr_status = "failed"
+                attachment.vision_status = "failed"
+                attachment.vision_summary = f"AI enrichment unavailable: {type(exc).__name__}"
+        else:
+            attachment.vision_summary = "Mock Kodo image processing completed"
     else:
         attachment.ocr_status = "not_applicable"
         attachment.vision_status = "unavailable"
         attachment.transcript_status = "unavailable"
         attachment.transcode_status = "ready"
         attachment.keyframe_status = "ready"
-        public_base = settings.qiniu_public_base_url.rstrip("/")
-        attachment.cover_path = f"{public_base}/{attachment.object_key}.cover.jpg"
-        attachment.preview_path = f"{public_base}/{attachment.object_key}"
-        attachment.vision_summary = "Mock Kodo video processing completed"
+        if is_real_kodo:
+            attachment.cover_path = f"{public_base}/{attachment.object_key}?vframe/jpg/offset/1"
+            attachment.preview_path = f"{public_base}/{attachment.object_key}"
+            attachment.vision_summary = None
+        else:
+            attachment.cover_path = f"{public_base}/{attachment.object_key}.cover.jpg"
+            attachment.preview_path = f"{public_base}/{attachment.object_key}"
+            attachment.vision_summary = "Mock Kodo video processing completed"
     return attachment
 
 

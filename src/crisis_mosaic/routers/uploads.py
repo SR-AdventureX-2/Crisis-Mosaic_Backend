@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from fastapi import APIRouter, Request, Response, status
 from fastapi.responses import FileResponse, RedirectResponse
+from sqlalchemy import select
 
 from ..config import get_settings
 from ..db import write_lock
@@ -22,6 +24,7 @@ from ..schemas.uploads import (
 )
 from ..services.attachments import attachment_state, serialize_attachment
 from ..services.events import emit_event, record_audit
+from ..services.qiniu import sign_download_url, verify_callback_authorization
 from ..services.uploads import (
     complete_remote_upload,
     create_image_intent,
@@ -36,6 +39,7 @@ from ..services.uploads import (
 from ..utils import isoformat, utcnow
 
 router = APIRouter(prefix="/uploads", tags=["Uploads"])
+callback_router = APIRouter(tags=["Uploads"])
 
 
 def _authorize_attachment(actor: Any, attachment: Attachment, header: str | None) -> None:
@@ -522,12 +526,20 @@ async def download_content(
     if attachment.storage_provider != "local_proxy":
         if not attachment.object_key:
             raise ApiError(409, "ATTACHMENT_NOT_READY", "附件尚未通过安全处理")
-        base = get_settings().qiniu_public_base_url.rstrip("/")
-        return RedirectResponse(
-            f"{base}/{attachment.object_key}?signature=mock&ttl="
-            f"{get_settings().signed_download_minutes}",
-            status_code=307,
-        )
+        settings = get_settings()
+        base = settings.qiniu_public_base_url.rstrip("/")
+        if attachment.storage_provider == "qiniu_kodo":
+            target_url = sign_download_url(
+                f"{base}/{attachment.object_key}",
+                ttl_seconds=settings.signed_download_minutes * 60,
+                settings=settings,
+            )
+        else:
+            target_url = (
+                f"{base}/{attachment.object_key}?signature=mock&ttl="
+                f"{settings.signed_download_minutes}"
+            )
+        return RedirectResponse(target_url, status_code=307)
     if not attachment.original_path:
         raise ApiError(409, "ATTACHMENT_NOT_READY", "附件尚未通过安全处理")
     path = Path(attachment.original_path)
@@ -557,3 +569,92 @@ async def download_thumbnail(
     if not await asyncio.to_thread(path.is_file):
         raise ApiError(404, "ATTACHMENT_CONTENT_MISSING", "缩略图文件不存在")
     return FileResponse(path, media_type="image/jpeg")
+
+
+@callback_router.post("/qiniu/callback", status_code=status.HTTP_200_OK)
+async def qiniu_upload_callback(request: Request, session: SessionDep) -> dict[str, Any]:
+    """七牛云上传回调：验签后标记附件上传完成并排队处理。"""
+    settings = get_settings()
+    if settings.media_storage_provider != "qiniu_kodo":
+        raise ApiError(404, "QINIU_CALLBACK_DISABLED", "七牛云回调未启用")
+    body = await request.body()
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    configured = urlsplit(settings.qiniu_callback_url)
+    if not verify_callback_authorization(
+        authorization=request.headers.get("authorization"),
+        path=configured.path or request.url.path,
+        query=configured.query or request.url.query,
+        body=body,
+        content_type=content_type,
+        settings=settings,
+    ):
+        raise ApiError(401, "QINIU_CALLBACK_UNAUTHORIZED", "七牛云回调签名校验失败")
+    form = parse_qs(body.decode("utf-8"))
+    key_values = form.get("key") or []
+    object_key = key_values[0] if key_values else ""
+    if not object_key:
+        raise ApiError(422, "QINIU_CALLBACK_INVALID", "回调缺少对象 key")
+    etag_values = form.get("hash") or []
+    etag = etag_values[0] if etag_values else None
+    fsize_values = form.get("fsize") or []
+    fsize = int(fsize_values[0]) if fsize_values and fsize_values[0].isdigit() else None
+    attachment = await session.scalar(
+        select(Attachment).where(Attachment.object_key == object_key)
+    )
+    if attachment is None:
+        raise ApiError(404, "ATTACHMENT_NOT_FOUND", "附件不存在")
+    if attachment.uploaded_at is not None:
+        return {
+            "success": True,
+            "attachment_id": attachment.id,
+            "status": attachment_state(attachment),
+        }
+    incident = await session.get(Incident, attachment.incident_id)
+    async with write_lock:
+        try:
+            await complete_remote_upload(
+                session,
+                attachment=attachment,
+                upload_session_id=None,
+                object_key=object_key,
+                etag=etag,
+                size_bytes=fsize,
+                parts=[],
+            )
+            active_sessions = (
+                await session.scalars(
+                    select(MediaUploadSession).where(
+                        MediaUploadSession.attachment_id == attachment.id,
+                        MediaUploadSession.status == "active",
+                    )
+                )
+            ).all()
+            for upload_session in active_sessions:
+                upload_session.status = "completed"
+            await record_audit(
+                session,
+                actor=None,
+                incident_id=attachment.incident_id,
+                action="attachment.content_uploaded",
+                resource_type="attachment",
+                resource_id=attachment.id,
+                request_id=getattr(request.state, "request_id", None),
+                after={"object_key": object_key, "etag": etag, "source": "qiniu_callback"},
+            )
+            if incident is not None:
+                await emit_event(
+                    session,
+                    incident=incident,
+                    event_type="attachment.processing",
+                    resource_type="attachment",
+                    resource_id=attachment.id,
+                    resource_revision=1,
+                    visibility="owner",
+                    owner_device_id=attachment.uploader_device_id,
+                    payload={"attachment_id": attachment.id, "status": "processing"},
+                )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+    return {"success": True, "attachment_id": attachment.id, "status": "processing"}
