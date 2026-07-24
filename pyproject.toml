@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crisis-mosaic-backend"
+version = "0.1.0"
+description = "Single-node functional P0 backend for Crisis Mosaic"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiosqlite>=0.20,<1",
+    "alembic>=1.14,<2",
+    "fastapi>=0.115,<1",
+    "filetype>=1.2,<2",
+    "httpx>=0.28,<1",
+    "ImageHash>=4.3,<5",
+    "Pillow>=11,<13",
+    "prometheus-client>=0.21,<1",
+    "pydantic-settings>=2.7,<3",
+    "pwdlib[argon2]>=0.2,<1",
+    "PyJWT[crypto]>=2.10,<3",
+    "python-multipart>=0.0.20,<1",
+    "shapely>=2.0,<3",
+    "sqlalchemy[asyncio]>=2.0.36,<2.1",
+    "structlog>=24.4,<26",
+    "tenacity>=9,<10",
+    "uuid6>=2024.7.10",
+    "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.14,<2",
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.25,<1",
+    "pytest-cov>=6,<8",
+    "respx>=0.22,<1",
+    "ruff>=0.9,<1",
+]
+
+[project.scripts]
+crisis-mosaic = "crisis_mosaic.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+crisis_mosaic = ["static/swagger/*", "schemas/*.json"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["migrations/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ASYNC240"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+packages = ["crisis_mosaic"]
+
+[tool.coverage.run]
+source = ["crisis_mosaic"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

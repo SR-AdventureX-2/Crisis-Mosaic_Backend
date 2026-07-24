@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://crisis-mosaic.local/schemas/realtime-event.json",
+  "title": "Crisis Mosaic realtime event",
+  "type": "object",
+  "required": [
+    "event_id",
+    "type",
+    "incident_id",
+    "sequence",
+    "resource_type",
+    "occurred_at",
+    "data"
+  ],
+  "properties": {
+    "event_id": {"type": "string"},
+    "type": {"type": "string"},
+    "incident_id": {"type": "string"},
+    "sequence": {"type": "integer", "minimum": 1},
+    "resource_type": {"type": "string"},
+    "resource_id": {"type": ["string", "null"]},
+    "resource_revision": {"type": ["integer", "null"]},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "visibility": {"enum": ["public", "owner", "operators"]},
+    "owner_device_id": {"type": ["string", "null"]},
+    "request_id": {"type": ["string", "null"]},
+    "data": {"type": "object"},
+    "payload": {"type": "object"}
+  },
+  "additionalProperties": true
+}
