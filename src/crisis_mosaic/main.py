@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import get_settings
+from .ai_websocket import router as ai_websocket_router
 from .db import configure_database, create_schema, dispose_database
 from .errors import add_error_openapi_responses, install_error_handlers
 from .middleware import add_idempotency_openapi_parameters, install_middleware
@@ -179,6 +180,7 @@ def create_app() -> FastAPI:
         questions.router,
         conflicts.router,
         ai.router,
+        ai_websocket_router,
         health.router,
         realtime_router,
     ):

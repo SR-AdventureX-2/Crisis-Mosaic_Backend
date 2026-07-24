@@ -25,6 +25,8 @@ def _openai_settings() -> Settings:
         ai_provider="openai_compatible",
         ai_api_key="test-only-api-key",
         ai_base_url="https://ai.invalid/v1",
+        # 固定为 True，避免开发机 .env 中的 AI_SUPPORTS_JSON_SCHEMA 泄漏进断言。
+        ai_supports_json_schema=True,
     )
 
 

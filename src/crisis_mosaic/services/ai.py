@@ -206,9 +206,19 @@ def _report_input_payload(request: ReportRefinementRequest) -> dict[str, Any]:
     }
 
 
+_TIME_LIKE_RE = re.compile(
+    r"\d{1,2}:\d{2}(?::\d{2})?"
+    r"|\d{4}[-/]\d{1,2}[-/]\d{1,2}"
+    r"|\d{1,2}月\d{1,2}日"
+    r"|\d{1,2}[时点](?:\d{1,2}分?)?"
+)
+
+
 def _summary_numbers_are_metrics(summary: str, metrics: dict[str, Any]) -> bool:
     allowed = {str(value) for value in metrics.values() if isinstance(value, int | float)}
-    return all(number in allowed for number in re.findall(r"\d+", summary))
+    # 时间/日期里的数字不是统计数量，先剔除以免误伤（如 18:44、7月24日）。
+    cleaned = _TIME_LIKE_RE.sub(" ", summary)
+    return all(number in allowed for number in re.findall(r"\d+", cleaned))
 
 
 def _prompt_hash_for(purpose: str, output_model: type[BaseModel]) -> str:
@@ -369,6 +379,16 @@ def _json_schema_response_format(output_model: type[BaseModel]) -> dict[str, Any
     }
 
 
+_JSON_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
+
+
+def _strip_json_fences(content: str) -> str:
+    # Some OpenAI-compatible proxies ignore response_format and let the model
+    # wrap its JSON output in Markdown code fences.
+    match = _JSON_FENCE_RE.match(content)
+    return match.group(1) if match else content
+
+
 async def _repair_structured_output[OutputT: BaseModel](
     *,
     invalid_content: str,
@@ -421,7 +441,7 @@ async def _repair_structured_output[OutputT: BaseModel](
             )
         if not isinstance(content, str):
             raise TypeError("AI repair response content is not text")
-        repaired = output_model.model_validate_json(content, strict=True)
+        repaired = output_model.model_validate_json(_strip_json_fences(content), strict=True)
         input_tokens, output_tokens = _extract_usage(body)
         return repaired, input_tokens, output_tokens
     except (httpx.TimeoutException, TimeoutError) as exc:
@@ -509,24 +529,31 @@ async def _invoke_structured[OutputT: BaseModel](
                 )
             if not isinstance(content, str):
                 raise TypeError("AI response content is not text")
-            result = output_model.model_validate_json(content, strict=True)
+            result = output_model.model_validate_json(_strip_json_fences(content), strict=True)
         except (httpx.TimeoutException, TimeoutError) as exc:
             raise ApiError(504, "AI_MODEL_TIMEOUT", "AI 服务响应超时") from exc
         except (httpx.HTTPError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
             raise ApiError(503, "AI_SERVICE_UNAVAILABLE", "AI 服务调用失败") from exc
         except ValidationError as exc:
-            allowed_ids = (allowed_evidence_ids or set()) | (allowed_source_refs or set())
-            result, repair_input_tokens, repair_output_tokens = await _repair_structured_output(
-                invalid_content=content,
-                validation_error=exc,
-                allowed_resource_ids=allowed_ids,
-                output_model=output_model,
-                model=model,
-                timeout_seconds=min(3.0, timeout_seconds),
-                settings=settings,
-            )
-            input_tokens = _sum_tokens(input_tokens, repair_input_tokens)
-            output_tokens = _sum_tokens(output_tokens, repair_output_tokens)
+            try:
+                # json_object 模式下常见类型偏差（如数字被写成字符串），先本地宽松解析，
+                # 避免为可自愈的偏差再发起一次远程修复调用。
+                result = output_model.model_validate_json(_strip_json_fences(content))
+            except ValidationError:
+                allowed_ids = (allowed_evidence_ids or set()) | (allowed_source_refs or set())
+                result, repair_input_tokens, repair_output_tokens = (
+                    await _repair_structured_output(
+                        invalid_content=content,
+                        validation_error=exc,
+                        allowed_resource_ids=allowed_ids,
+                        output_model=output_model,
+                        model=model,
+                        timeout_seconds=min(30.0, timeout_seconds),
+                        settings=settings,
+                    )
+                )
+                input_tokens = _sum_tokens(input_tokens, repair_input_tokens)
+                output_tokens = _sum_tokens(output_tokens, repair_output_tokens)
     reference_valid = True
     if isinstance(result, ConflictAnalysisOutput):
         try:
@@ -1573,6 +1600,16 @@ async def _fail_async_analysis(
                     resource_revision=(
                         current_conflict.revision if current_conflict else analysis.input_version
                     ),
+                    payload={"analysis_id": analysis.id, "error_code": error.code},
+                )
+            elif analysis.analysis_type == "command_brief":
+                await emit_event(
+                    session,
+                    incident=incident,
+                    event_type="command_brief.failed",
+                    resource_type="ai_analysis",
+                    resource_id=analysis.id,
+                    resource_revision=analysis.input_version,
                     payload={"analysis_id": analysis.id, "error_code": error.code},
                 )
             await record_audit(

@@ -417,6 +417,8 @@ async def _call_with_idempotency(
 
 def install_middleware(app: FastAPI) -> None:
     limiter = _RateLimiter()
+    # 暴露给 AI WebSocket 网关（crisis_mosaic.ai_websocket）复用同一限流器。
+    app.state.rate_limiter = limiter
 
     @app.middleware("http")
     async def request_context(request: Request, call_next):  # type: ignore[no-untyped-def]

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
-from fastapi import APIRouter, Request, status
+from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect, status
 from sqlalchemy import select
 
-from ..db import write_lock
+from ..db import session_factory, write_lock
 from ..dependencies import ActorDep, IncidentHeader, SessionDep, ensure_incident_access
 from ..errors import ApiError
 from ..models import AiAnalysis, AiJobStep, Incident
+from ..realtime import _actor_from_token
 from ..responses import SuccessEnvelope, success
 from ..schemas.ai import (
     AnalysisAcceptedResponse,
@@ -32,6 +34,10 @@ from ..services.map_features import upsert_conflict_map_feature
 from ..utils import isoformat, utcnow
 
 router = APIRouter(tags=["AI"])
+
+# WebSocket 状态流：服务端监测间隔与单连接最长推送时长。
+_WS_POLL_SECONDS = 1.0
+_WS_MAX_STREAM_SECONDS = 600.0
 
 
 def _status_payload(analysis: AiAnalysis) -> dict[str, Any]:
@@ -59,6 +65,32 @@ def _status_payload(analysis: AiAnalysis) -> dict[str, Any]:
         "created_at": isoformat(analysis.created_at),
         "completed_at": isoformat(analysis.completed_at),
     }
+
+
+async def _analysis_snapshot(session: Any, analysis: AiAnalysis) -> dict[str, Any]:
+    steps = list(
+        (
+            await session.scalars(
+                select(AiJobStep)
+                .where(AiJobStep.analysis_id == analysis.id)
+                .order_by(AiJobStep.started_at, AiJobStep.id)
+            )
+        ).all()
+    )
+    data = _status_payload(analysis)
+    data["steps"] = [
+        {
+            "id": step.id,
+            "name": step.name,
+            "status": step.status,
+            "started_at": isoformat(step.started_at),
+            "finished_at": isoformat(step.finished_at),
+            "error_code": step.error_code,
+            "details": step.details,
+        }
+        for step in steps
+    ]
+    return data
 
 
 @router.post(
@@ -311,35 +343,108 @@ async def analysis_status(
     session: SessionDep,
     incident_header: IncidentHeader,
 ) -> dict[str, Any]:
+    """查询 AI 分析状态（轮询接口）。
+
+    推荐改用 WebSocket 推送通道 `WS /api/v1/ai/analyses/{analysis_id}/ws`
+    （OpenAPI 不支持 WebSocket，故未出现在本文档中）：连接后首条消息发送
+    `{"type": "authenticate", "access_token": "..."}` 完成认证，服务端在状态
+    变化时推送 `analysis_status` 消息，终态（succeeded/failed）后以 1000 关闭。
+    """
     analysis = await session.get(AiAnalysis, analysis_id)
     if not analysis:
         raise ApiError(404, "ANALYSIS_NOT_FOUND", "AI 分析不存在")
     ensure_incident_access(actor, analysis.incident_id, incident_header)
     if actor.role == "resident" and analysis.created_by_id != actor.subject_id:
         raise ApiError(403, "ANALYSIS_ACCESS_DENIED", "无权访问该 AI 分析")
-    steps = list(
-        (
-            await session.scalars(
-                select(AiJobStep)
-                .where(AiJobStep.analysis_id == analysis.id)
-                .order_by(AiJobStep.started_at, AiJobStep.id)
-            )
-        ).all()
-    )
-    data = _status_payload(analysis)
-    data["steps"] = [
-        {
-            "id": step.id,
-            "name": step.name,
-            "status": step.status,
-            "started_at": isoformat(step.started_at),
-            "finished_at": isoformat(step.finished_at),
-            "error_code": step.error_code,
-            "details": step.details,
-        }
-        for step in steps
-    ]
+    data = await _analysis_snapshot(session, analysis)
     return success(data, request)
+
+
+async def _consume_ws_client_messages(websocket: WebSocket) -> None:
+    try:
+        while True:
+            incoming = await websocket.receive_json()
+            if incoming.get("type") == "ping":
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        return
+
+
+@router.websocket("/ai/analyses/{analysis_id}/ws")
+async def analysis_status_stream(websocket: WebSocket, analysis_id: str) -> None:
+    """AI 分析状态推送通道，替代客户端对 GET /ai/analyses/{id} 的轮询。
+
+    协议与 /realtime 一致：连接后首条消息必须是
+    {"type": "authenticate", "access_token": "..."}，禁止在 URL 中携带令牌。
+    服务端在状态/步骤变化时推送 analysis_status 消息，分析进入终态
+    （succeeded/failed）后推送最终快照并以 1000 正常关闭。
+    """
+    await websocket.accept()
+    if "access_token" in websocket.query_params:
+        await websocket.send_json({"type": "error", "code": "QUERY_TOKEN_FORBIDDEN"})
+        await websocket.close(code=4401, reason="tokens are forbidden in URL")
+        return
+    try:
+        message = await asyncio.wait_for(websocket.receive_json(), timeout=5)
+    except (TimeoutError, WebSocketDisconnect):
+        await websocket.close(code=4408, reason="authentication message timeout")
+        return
+    if message.get("type") != "authenticate" or not isinstance(message.get("access_token"), str):
+        await websocket.send_json({"type": "error", "code": "AUTHENTICATION_REQUIRED"})
+        await websocket.close(code=4401, reason="first message must authenticate")
+        return
+    async with session_factory()() as session:
+        analysis = await session.get(AiAnalysis, analysis_id)
+        incident_id = analysis.incident_id if analysis else None
+        created_by_id = analysis.created_by_id if analysis else None
+    if incident_id is None:
+        await websocket.close(code=4404, reason="analysis not found")
+        return
+    try:
+        actor, expires_at = await _actor_from_token(message["access_token"], incident_id)
+    except PermissionError:
+        await websocket.close(code=4403, reason="incident access denied")
+        return
+    except Exception:
+        await websocket.close(code=4401, reason="invalid or expired access token")
+        return
+    if actor.role == "resident" and created_by_id != actor.subject_id:
+        await websocket.close(code=4403, reason="analysis access denied")
+        return
+
+    receiver = asyncio.create_task(_consume_ws_client_messages(websocket))
+    deadline = utcnow().timestamp() + _WS_MAX_STREAM_SECONDS
+    last_sent: dict[str, Any] | None = None
+    try:
+        while True:
+            now = utcnow().timestamp()
+            if now >= expires_at:
+                await websocket.close(code=4401, reason="access token expired")
+                return
+            if now >= deadline:
+                await websocket.close(code=4408, reason="analysis stream budget exceeded")
+                return
+            async with session_factory()() as session:
+                current = await session.get(AiAnalysis, analysis_id)
+                data = (
+                    await _analysis_snapshot(session, current) if current is not None else None
+                )
+            if data is None:
+                await websocket.close(code=4404, reason="analysis not found")
+                return
+            if data != last_sent:
+                await websocket.send_json({"type": "analysis_status", "data": data})
+                last_sent = data
+            if data["status"] in {"succeeded", "failed"}:
+                await websocket.close(code=1000, reason="analysis finished")
+                return
+            if receiver.done():
+                return
+            await asyncio.sleep(_WS_POLL_SECONDS)
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        receiver.cancel()
 
 
 @router.post(
