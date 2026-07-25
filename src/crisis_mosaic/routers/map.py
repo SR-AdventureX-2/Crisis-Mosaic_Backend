@@ -97,13 +97,24 @@ def _is_owner_report(feature: MapFeature, actor: Any) -> bool:
     )
 
 
+def _is_resident_report_derived(feature: MapFeature) -> bool:
+    return (
+        feature.kind in {"conflict", "blind_spot"}
+        and (feature.private_data or {}).get("resident_report_derived") is True
+    )
+
+
 def _resident_position(
     feature: MapFeature,
     actor: Any,
     coordinate_system: str,
 ) -> tuple[float, float, str]:
     latitude, longitude = _position(feature, coordinate_system)
-    if not actor.is_resident or feature.kind != "report" or _is_owner_report(feature, actor):
+    if not actor.is_resident:
+        return latitude, longitude, "exact"
+    if feature.kind == "report" and _is_owner_report(feature, actor):
+        return latitude, longitude, "exact"
+    if feature.kind != "report" and not _is_resident_report_derived(feature):
         return latitude, longitude, "exact"
     return round(latitude, 3), round(longitude, 3), "fuzzy_100m"
 
@@ -231,7 +242,7 @@ async def map_view(
             if actor.is_resident
             else {**(feature.public_data or {}), **(feature.private_data or {})}
         )
-        if actor.is_resident and feature.kind == "report" and precision != "exact":
+        if actor.is_resident and precision != "exact":
             visible_data = {
                 key: value
                 for key, value in visible_data.items()
@@ -243,6 +254,8 @@ async def map_view(
         title = feature.title
         if actor.is_resident and feature.kind == "report" and precision != "exact":
             title = "现场上报位置已模糊化"
+        elif actor.is_resident and _is_resident_report_derived(feature):
+            title = "现场信息冲突" if feature.kind == "conflict" else "现场信息盲区"
         items.append(
             {
                 "id": f"{feature.kind}:{feature.source_ref}",

@@ -36,6 +36,10 @@ from ..services.contacts import (
 from ..services.events import emit_event, record_audit
 from ..services.idempotency import finish, replay_or_reserve
 from ..services.notifications import enqueue_operator_notifications
+from ..services.report_observations import (
+    deactivate_report_observation,
+    process_report_observation,
+)
 from ..services.reports import (
     ai_priority_from_refinement,
     apply_cursor,
@@ -238,6 +242,13 @@ async def post_report(
                 visibility="owner",
                 owner_device_id=report.reporter_device_id,
                 payload=serialize_report(report, contact=contact, attachments=attachments),
+            )
+            await process_report_observation(
+                session,
+                incident=incident,
+                report=report,
+                actor=actor,
+                request_id=_request_id(request),
             )
             notification_event_type = (
                 "urgent_report.created" if report.is_urgent else "report.created"
@@ -589,6 +600,14 @@ async def patch_report(
                     attachments=attachments,
                 ),
             )
+            if fields & {"category", "content_original", "content_display", "location"}:
+                await process_report_observation(
+                    session,
+                    incident=incident,
+                    report=report,
+                    actor=actor,
+                    request_id=_request_id(request),
+                )
             contact = await _contact_for_report(session, report)
             return success(
                 serialize_report(report, actor, contact=contact, attachments=attachments),
@@ -623,6 +642,14 @@ async def delete_report(
             report.deleted_at = deleted_at
             report.revision += 1
             report.updated_at = deleted_at
+            await deactivate_report_observation(
+                session,
+                incident=incident,
+                report=report,
+                actor=actor,
+                request_id=_request_id(request),
+                reason="source_report_deleted",
+            )
             tombstone = {
                 "report_id": report.id,
                 "revision": report.revision,
@@ -805,6 +832,23 @@ async def patch_report_status(
             report.status = payload.status
             report.revision += 1
             report.updated_at = utcnow()
+            if payload.status == "invalid":
+                await deactivate_report_observation(
+                    session,
+                    incident=incident,
+                    report=report,
+                    actor=actor,
+                    request_id=_request_id(request),
+                    reason="source_report_invalid",
+                )
+            elif before["status"] == "invalid":
+                await process_report_observation(
+                    session,
+                    incident=incident,
+                    report=report,
+                    actor=actor,
+                    request_id=_request_id(request),
+                )
             snapshot = report_snapshot(report)
             session.add(
                 ReportRevision(

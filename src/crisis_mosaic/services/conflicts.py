@@ -60,6 +60,19 @@ def fragment_snapshot(fragment: InformationFragment) -> dict[str, Any]:
     }
 
 
+def fragments_share_source(
+    first: InformationFragment,
+    second: InformationFragment,
+) -> bool:
+    if first.source_cluster_id and second.source_cluster_id:
+        return first.source_cluster_id == second.source_cluster_id
+    return (
+        first.source_type == second.source_type
+        and first.source_ref_id is not None
+        and first.source_ref_id == second.source_ref_id
+    )
+
+
 async def evidence_snapshot(
     session: AsyncSession,
     reference: EvidenceReference,
@@ -359,13 +372,17 @@ async def detect_structured_fragment_conflict(
     """Detect contradictory structured claims within the configured time/radius window."""
 
     settings = settings or get_settings()
+    fragment_location = "".join(fragment.location_text.split()).casefold()
+    fragment_has_position = (
+        fragment.latitude is not None
+        and fragment.longitude is not None
+        and fragment.coordinate_system is not None
+    )
     if (
         not fragment.claim_key
         or not fragment.claim_value
         or fragment.claim_value.strip().lower() == "unknown"
-        or fragment.latitude is None
-        or fragment.longitude is None
-        or fragment.coordinate_system is None
+        or (not fragment_has_position and not fragment_location)
     ):
         return None
     candidates = list(
@@ -383,38 +400,50 @@ async def detect_structured_fragment_conflict(
         ).all()
     )
     current_time = as_utc(fragment.observed_at or fragment.received_at)
-    current = normalize(
-        fragment.latitude,
-        fragment.longitude,
-        fragment.coordinate_system,
-    )
+    current = None
+    if fragment_has_position:
+        assert fragment.latitude is not None
+        assert fragment.longitude is not None
+        assert fragment.coordinate_system is not None
+        current = normalize(
+            fragment.latitude,
+            fragment.longitude,
+            fragment.coordinate_system,
+        )
     matching: list[InformationFragment] = []
     for candidate in candidates:
-        if (
-            not candidate.claim_value
-            or candidate.claim_value.strip().lower() == "unknown"
-            or candidate.latitude is None
-            or candidate.longitude is None
-            or candidate.coordinate_system is None
-        ):
+        if fragments_share_source(fragment, candidate):
+            continue
+        if not candidate.claim_value or candidate.claim_value.strip().lower() == "unknown":
             continue
         candidate_time = as_utc(candidate.observed_at or candidate.received_at)
         if abs(current_time - candidate_time) > timedelta(hours=settings.conflict_window_hours):
             continue
-        previous = normalize(
-            candidate.latitude,
-            candidate.longitude,
-            candidate.coordinate_system,
+        candidate_has_position = (
+            candidate.latitude is not None
+            and candidate.longitude is not None
+            and candidate.coordinate_system is not None
         )
-        if (
-            haversine_m(
-                current.wgs84_latitude,
-                current.wgs84_longitude,
-                previous.wgs84_latitude,
-                previous.wgs84_longitude,
+        if current is not None and candidate_has_position:
+            assert candidate.latitude is not None
+            assert candidate.longitude is not None
+            assert candidate.coordinate_system is not None
+            previous = normalize(
+                candidate.latitude,
+                candidate.longitude,
+                candidate.coordinate_system,
             )
-            > settings.conflict_radius_m
-        ):
+            if (
+                haversine_m(
+                    current.wgs84_latitude,
+                    current.wgs84_longitude,
+                    previous.wgs84_latitude,
+                    previous.wgs84_longitude,
+                )
+                > settings.conflict_radius_m
+            ):
+                continue
+        elif "".join(candidate.location_text.split()).casefold() != fragment_location:
             continue
         matching.append(candidate)
     if not matching:
@@ -433,7 +462,11 @@ async def detect_structured_fragment_conflict(
     )
 
 
-async def mark_fact_under_review(session: AsyncSession, case: ConflictCase) -> FactRecord | None:
+async def mark_fact_under_review(
+    session: AsyncSession,
+    case: ConflictCase,
+    reason: str = "conflict_reopened",
+) -> FactRecord | None:
     fact = await session.scalar(
         select(FactRecord).where(
             FactRecord.incident_id == case.incident_id,
@@ -458,7 +491,7 @@ async def mark_fact_under_review(session: AsyncSession, case: ConflictCase) -> F
         confidence=previous.confidence if previous else None,
         source_conflict_id=case.id,
         source_analysis_id=None,
-        context_snapshot={"reason": "conflict_reopened", "conflict_revision": case.revision},
+        context_snapshot={"reason": reason, "conflict_revision": case.revision},
         accepted_evidence_ids=[],
         decision_snapshot={"automatic_transition": "under_review"},
         decided_by="system",
@@ -466,6 +499,7 @@ async def mark_fact_under_review(session: AsyncSession, case: ConflictCase) -> F
     session.add(version)
     await session.flush()
     fact.status = "under_review"
+    fact.is_public = False
     fact.current_revision = version.revision
     fact.current_version_id = version.id
     feature = await session.scalar(
@@ -478,10 +512,7 @@ async def mark_fact_under_review(session: AsyncSession, case: ConflictCase) -> F
     if feature is not None:
         feature.status = "under_review"
         feature.revision = version.revision
-        feature.public_data = {
-            **(feature.public_data or {}),
-            "fact_revision": version.revision,
-        }
+        feature.public_data = {}
         feature.private_data = {
             **(feature.private_data or {}),
             "fact_revision": version.revision,

@@ -222,7 +222,9 @@ def fragment_data(
         "incident_id": item.incident_id,
         "source_type": item.source_type,
         "source_ref_id": item.source_ref_id,
-        "source_cluster_id": item.source_cluster_id,
+        "source_cluster_id": (
+            None if item.source_type == "resident_report" else item.source_cluster_id
+        ),
         "topic": item.topic,
         "claim_key": item.claim_key,
         "claim_value": item.claim_value,
@@ -1147,8 +1149,12 @@ async def list_fragments(
 ) -> dict[str, Any]:
     ensure_incident_access(actor, incident_id, incident_header)
     filters = [InformationFragment.incident_id == incident_id]
+    if actor.is_resident:
+        filters.append(InformationFragment.source_type != "resident_report")
     if status:
         filters.append(InformationFragment.status == status)
+    else:
+        filters.append(InformationFragment.status != "withdrawn")
     if updated_after:
         filters.append(InformationFragment.updated_at > as_utc(updated_after).replace(tzinfo=None))
     supplied_bbox = [west, south, east, north]

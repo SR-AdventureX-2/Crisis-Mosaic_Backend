@@ -28,6 +28,39 @@ from ..utils import as_utc, canonical_json, sha256_text, utcnow
 from .attachments import serialize_attachment
 from .contacts import create_reporter_contact, serialize_contact_masked
 
+_IMMEDIATE_DANGER_RISK_TAGS = frozenset(
+    {
+        "trapped_people",
+        "missing_people",
+        "injured_people",
+        "severe_bleeding",
+        "unconscious_person",
+        "breathing_difficulty",
+        "rising_water",
+        "rapid_current",
+        "deep_flooding",
+        "building_collapse",
+        "landslide",
+        "fire",
+        "electric_hazard",
+        "gas_leak",
+        "bridge_damage",
+    }
+)
+_OPERATIONAL_RISK_TAGS = frozenset(
+    {
+        "road_blocked",
+        "medical_shortage",
+        "drinking_water_shortage",
+        "food_shortage",
+        "unsafe_shelter",
+        "communication_outage",
+    }
+)
+_PRIORITY_RISK_TAGS = _IMMEDIATE_DANGER_RISK_TAGS | _OPERATIONAL_RISK_TAGS
+_AI_MEDIUM_CONFIDENCE_MIN = 0.75
+_AI_HIGH_CONFIDENCE_MIN = 0.85
+
 
 async def get_incident(session: AsyncSession, incident_id: str) -> Incident:
     incident = await session.scalar(
@@ -504,17 +537,31 @@ async def validate_report_refinement(
 def ai_priority_from_refinement(analysis: AiAnalysis | None) -> Priority | None:
     if analysis is None or analysis.output is None:
         return None
-    if analysis.output.get("suggest_urgent") is not True:
-        return None
 
     confidence = analysis.output.get("confidence")
     if (
-        isinstance(confidence, (int, float))
-        and not isinstance(confidence, bool)
-        and confidence >= 0.70
+        not isinstance(confidence, (int, float))
+        or isinstance(confidence, bool)
+        or confidence < _AI_MEDIUM_CONFIDENCE_MIN
+    ):
+        return "low"
+
+    raw_risk_tags = analysis.output.get("detected_risk_tags")
+    if not isinstance(raw_risk_tags, list) or not all(
+        isinstance(tag, str) for tag in raw_risk_tags
+    ):
+        return "low"
+    risk_tags = set(raw_risk_tags) & _PRIORITY_RISK_TAGS
+    if not risk_tags:
+        return "low"
+
+    if (
+        analysis.output.get("suggest_urgent") is True
+        and confidence >= _AI_HIGH_CONFIDENCE_MIN
+        and risk_tags & _IMMEDIATE_DANGER_RISK_TAGS
     ):
         return "high"
-    return None
+    return "medium"
 
 
 def encode_cursor(report: Report) -> str:

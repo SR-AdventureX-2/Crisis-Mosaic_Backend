@@ -83,12 +83,28 @@ class ReportRefinementOutput(BaseModel):
 
     refined_content: str = Field(min_length=1, max_length=5000)
     risk_hint: str = Field(max_length=1000)
-    suggest_urgent: bool
+    suggest_urgent: bool = Field(
+        description=(
+            "True only when the supplied report or non-text visual evidence directly supports "
+            "a concrete current danger represented by detected_risk_tags."
+        )
+    )
     detected_risk_tags: list[RiskTag] = Field(
         max_length=20,
+        description=(
+            "Risks directly supported by concrete report facts or non-text media observations; "
+            "category, location, greetings, test text and random text are not evidence."
+        ),
         json_schema_extra={"uniqueItems": True},
     )
-    confidence: float = Field(ge=0, le=1)
+    confidence: float = Field(
+        ge=0,
+        le=1,
+        description=(
+            "Confidence in faithful refinement and correct risk extraction, not risk severity "
+            "and never sufficient by itself to raise report priority."
+        ),
+    )
 
     @field_validator("detected_risk_tags")
     @classmethod

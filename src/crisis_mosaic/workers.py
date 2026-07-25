@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import or_, select
@@ -17,7 +17,7 @@ from .observability import (
     observe_outbox_delivery,
 )
 from .services.events import emit_event, record_audit
-from .utils import utcnow
+from .utils import as_utc, utcnow
 
 logger = logging.getLogger(__name__)
 OutboxHandler = Callable[[dict[str, Any]], Awaitable[None]]
@@ -240,6 +240,40 @@ class WorkerRuntime:
                     from .services.ai import process_analysis
 
                     await process_analysis(session, str(job.payload["analysis_id"]), self.settings)
+                elif job.job_type == "blind_spot.detect":
+                    from .services.report_observations import run_report_blind_spot_detection
+
+                    async with write_lock:
+                        due_at_value = job.payload.get("due_at")
+                        due_at = (
+                            as_utc(datetime.fromisoformat(due_at_value.replace("Z", "+00:00")))
+                            if isinstance(due_at_value, str)
+                            else as_utc(job.run_after)
+                        )
+                        if utcnow() < due_at:
+                            job.status = "queued"
+                            job.attempts = max(0, job.attempts - 1)
+                            job.run_after = due_at
+                            job.lease_expires_at = None
+                            job.last_error = "deferred until the fixed blind-spot due time"
+                            job.updated_at = utcnow()
+                            await session.commit()
+                            return
+                        grace_minutes_value = job.payload.get("grace_minutes")
+                        await run_report_blind_spot_detection(
+                            session,
+                            incident_id=str(job.payload["incident_id"]),
+                            fragment_id=str(job.payload["fragment_id"]),
+                            fragment_revision=int(job.payload["fragment_revision"]),
+                            due_at=due_at,
+                            grace_minutes=(
+                                int(grace_minutes_value)
+                                if grace_minutes_value is not None
+                                else None
+                            ),
+                            settings=self.settings,
+                        )
+                        await session.commit()
                 else:
                     raise RuntimeError(f"unknown background job type: {job.job_type}")
             except asyncio.CancelledError:
@@ -299,6 +333,8 @@ class WorkerRuntime:
             async with session_factory()() as session:
                 job = await session.get(BackgroundJob, job_id)
                 if not job:
+                    return
+                if job.status != "running":
                     return
                 job.lease_expires_at = None
                 job.updated_at = utcnow()

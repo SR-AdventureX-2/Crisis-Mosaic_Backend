@@ -175,6 +175,7 @@ class Settings(BaseSettings):
     directed_min_valid_answers: int = 2
     conflict_radius_m: float = 200.0
     conflict_window_hours: int = 6
+    blind_spot_report_grace_minutes: int = Field(default=30, ge=0)
     location_future_tolerance_minutes: int = 5
     max_location_accuracy_m: float = 5000.0
     business_retention_days: int = Field(default=180, ge=1)

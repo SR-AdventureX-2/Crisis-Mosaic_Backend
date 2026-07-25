@@ -5,6 +5,7 @@ import asyncio
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from crisis_mosaic.domain.priority import effective_priority
 from crisis_mosaic.errors import ApiError
 from crisis_mosaic.models import AiAnalysis, AnonymousDevice, Base, Incident
 from crisis_mosaic.schemas.reports import ReportCreate
@@ -17,43 +18,58 @@ from crisis_mosaic.services.reports import (
 from crisis_mosaic.utils import canonical_json, sha256_text
 
 
-def _analysis(*, suggest_urgent: bool, confidence: object = None) -> AiAnalysis:
-    output: dict[str, object] = {"suggest_urgent": suggest_urgent}
+def _analysis(
+    *,
+    suggest_urgent: bool,
+    confidence: object = None,
+    risk_tags: list[str] | None = None,
+) -> AiAnalysis:
+    output: dict[str, object] = {
+        "suggest_urgent": suggest_urgent,
+        "detected_risk_tags": risk_tags or [],
+    }
     if confidence is not None:
         output["confidence"] = confidence
     return AiAnalysis(output=output)
 
 
-@pytest.mark.parametrize("confidence", [0.0, 0.39, 0.70, 1.0, None])
-def test_non_urgent_ai_suggestion_keeps_category_default(confidence: object) -> None:
-    assert (
-        ai_priority_from_refinement(
-            _analysis(suggest_urgent=False, confidence=confidence),
-        )
-        is None
-    )
+@pytest.mark.parametrize("category", ["rescue", "medical", "water", "food", "shelter", "road"])
+def test_category_alone_never_raises_priority(category: str) -> None:
+    assert effective_priority(category, is_urgent=False) == ("low", "category_default")
 
 
 @pytest.mark.parametrize(
-    ("confidence", "expected"),
+    ("suggest_urgent", "confidence", "risk_tags", "expected"),
     [
-        (1.0, "high"),
-        (0.70, "high"),
-        (0.6999, None),
-        (0.40, None),
-        (0.0, None),
-        (None, None),
-        ("0.91", None),
-        (True, None),
+        (False, 0.99, [], "low"),  # greeting or random content
+        (True, 0.99, [], "low"),  # confidence and urgency cannot replace evidence
+        (True, 0.99, ["elderly"], "low"),  # vulnerability alone is not danger
+        (False, 0.75, ["road_blocked"], "medium"),
+        (True, 0.99, ["road_blocked"], "medium"),
+        (False, 0.99, ["trapped_people"], "medium"),
+        (True, 0.85, ["trapped_people"], "high"),
+        (True, 0.95, ["injured_people"], "high"),
+        (True, 0.8499, ["injured_people"], "medium"),
+        (True, 0.7499, ["injured_people"], "low"),
+        (True, None, ["injured_people"], "low"),
+        (True, "0.95", ["injured_people"], "low"),
+        (True, True, ["injured_people"], "low"),
+        (True, 0.99, ["unknown_risk"], "low"),
     ],
 )
-def test_urgent_ai_suggestion_requires_confidence_threshold(
+def test_ai_priority_requires_supported_risk_and_conservative_thresholds(
+    suggest_urgent: bool,
     confidence: object,
+    risk_tags: list[str],
     expected: str | None,
 ) -> None:
     assert (
         ai_priority_from_refinement(
-            _analysis(suggest_urgent=True, confidence=confidence),
+            _analysis(
+                suggest_urgent=suggest_urgent,
+                confidence=confidence,
+                risk_tags=risk_tags,
+            ),
         )
         == expected
     )
@@ -64,7 +80,7 @@ def test_missing_analysis_or_output_has_no_ai_priority() -> None:
     assert ai_priority_from_refinement(AiAnalysis(output=None)) is None
 
 
-def test_create_report_persists_high_priority_from_owned_ai_refinement() -> None:
+def test_create_report_persists_evidence_based_ai_priority() -> None:
     async def scenario() -> None:
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         async with engine.begin() as connection:
@@ -114,6 +130,7 @@ def test_create_report_persists_high_priority_from_owned_ai_refinement() -> None
                         output={
                             "refined_content": refined_content,
                             "suggest_urgent": True,
+                            "detected_risk_tags": ["road_blocked"],
                             "confidence": 0.82,
                         },
                         prompt_version="test-v1",
@@ -163,7 +180,7 @@ def test_create_report_persists_high_priority_from_owned_ai_refinement() -> None
                         ),
                     )
 
-                    assert report.priority == "high"
+                    assert report.priority == "medium"
                     assert report.priority_source == "ai"
                     assert report.ai_refinement_id == refinement.id
                     with pytest.raises(ApiError) as mismatch:
@@ -201,6 +218,7 @@ def test_create_report_persists_high_priority_from_owned_ai_refinement() -> None
                         output={
                             "refined_content": refined_content,
                             "suggest_urgent": True,
+                            "detected_risk_tags": ["road_blocked"],
                             "confidence": 0.82,
                         },
                         prompt_version="test-v1",

@@ -16,7 +16,7 @@ AiPurpose = Literal[
 ]
 
 COMMON_SYSTEM_PROMPT_VERSION = "cm-common-safety-v1.0.0"
-REPORT_REFINEMENT_PROMPT_VERSION = "cm-report-refinement-v1.1.0"
+REPORT_REFINEMENT_PROMPT_VERSION = "cm-report-refinement-v1.2.0"
 MEDIA_EVIDENCE_PROMPT_VERSION = "cm-media-evidence-extraction-v1.1.0"
 CONFLICT_ANALYSIS_PROMPT_VERSION = "cm-conflict-analysis-v1.1.0"
 COMMAND_BRIEF_PROMPT_VERSION = "cm-command-brief-v1.0.0"
@@ -94,12 +94,13 @@ REPORT_REFINEMENT_TASK_SYSTEM_PROMPT = """【当前任务：居民上报整理�
 3. 不在 refined_content 中加入居民没有表达的行动建议、处置结果、推测原因或新增事实。附件只能用于风险识别，不能把附件推断改写成居民原话。
 4. 风险和操作提醒只写入 risk_hint，不混入居民事实文本。detected_risk_tags 和 suggest_urgent 可以使用画面直接可见事实、已有 vision_summary 和视频 transcript_text。
 5. 对人数、地点、时间、方向、状态、否定词和不确定词进行一致性保护。
-6. 只从允许的风险标签中选择 detected_risk_tags。
-7. suggest_urgent 只表示“建议居民勾选紧急并尽快提交”，不表示系统已经标记紧急。
-8. confidence 表示你对“整理未改变事实且风险识别正确”的综合信心。
+6. 只从允许的风险标签中选择 detected_risk_tags。只有居民原文、非文字画面观察、已有 vision_summary 或视频 transcript_text 直接支持一项具体现场事实时，才能添加对应标签；category、位置、问候、情绪、测试文字、随机文字、单纯求助或模型常识都不能单独支持风险标签。
+7. suggest_urgent 只表示“建议居民勾选紧急并尽快提交”，不表示系统已经标记紧急。仅当资料直接支持具体的当前危险事实且至少有一个对应的高风险 detected_risk_tag 时才可为 true；不得仅因 category 为 rescue/medical 而建议紧急。
+8. confidence 表示你对“整理未改变事实且风险识别正确”的综合信心，不表示风险严重程度，也不能替代具体现场事实或风险标签。低信息、问候、测试或随机内容即使容易整理，也不得因整理信心高而生成风险标签或建议紧急。
 9. attachments 中的 model_image_indices 与请求中随后附带的图片内容按 1 开始一一对应；model_image_kind=video_keyframe 表示这些图片是视频的有限关键帧，不代表完整视频内容。
 10. 禁止对附带图片或视频关键帧执行 OCR、读取、转录或复述画面文字。只能分析非文字视觉内容；视频 transcript_text 是独立音频转录，可用于风险识别。
 11. raw_media_status=unavailable 且没有可用 vision_summary 或 transcript_text 时，不得猜测附件内容；必须在 risk_hint 中说明附件未能读取，并保守降低 confidence。
+12. 如果输入只包含问候、测试、随机或无关内容，refined_content 必须忠实保留其低信息性质，detected_risk_tags 返回空数组，suggest_urgent 返回 false；不得补写“上报救援需求”“存在险情”等输入中没有的事实。
 
 risk_hint 规则：
 - 有明确紧急风险时，简洁说明检测到的风险，并建议居民确认紧急标记、尽快提交。
