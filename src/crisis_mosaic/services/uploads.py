@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import io
 import json
 import secrets
 from collections.abc import AsyncIterator
@@ -37,6 +38,32 @@ SAFE_EXIF_TAGS = {271: "make", 272: "model", 306: "datetime", 36867: "captured_a
 
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+def _video_keyframe_offsets(duration_ms: int) -> list[float]:
+    duration_seconds = max(duration_ms / 1000, 0.0)
+    candidates = (0.0, duration_seconds / 2, max(0.0, duration_seconds - 0.1))
+    return list(dict.fromkeys(round(value, 3) for value in candidates))
+
+
+def _validated_visual_bytes(content: bytes, settings: Settings) -> bytes:
+    Image.MAX_IMAGE_PIXELS = settings.max_image_pixels
+    try:
+        with Image.open(io.BytesIO(content)) as probe:
+            if probe.width * probe.height > settings.max_image_pixels:
+                raise ApiError(422, "IMAGE_PIXEL_LIMIT_EXCEEDED", "图片像素数量超过限制")
+            probe.verify()
+        with Image.open(io.BytesIO(content)) as image:
+            image.load()
+            normalized = ImageOps.exif_transpose(image).convert("RGB")
+            normalized.thumbnail((1280, 1280))
+            output = io.BytesIO()
+            normalized.save(output, format="JPEG", quality=88, optimize=True)
+            return output.getvalue()
+    except Image.DecompressionBombError as exc:
+        raise ApiError(422, "IMAGE_PIXEL_LIMIT_EXCEEDED", "图片像素数量超过限制") from exc
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ApiError(422, "IMAGE_DECODE_FAILED", "媒体画面无法安全解码") from exc
 
 
 def safe_storage_path(root: Path, bucket: str, attachment_id: str, suffix: str) -> Path:
@@ -218,7 +245,7 @@ async def create_media_intent(
         duration_ms=duration_ms,
         metadata_status="pending",
         malware_scan_status="pending",
-        ocr_status="pending" if media_type == "image" else "not_applicable",
+        ocr_status="not_applicable",
         vision_status="pending",
         transcript_status="pending" if media_type == "video" else "not_applicable",
         transcode_status="pending" if media_type == "video" else "not_applicable",
@@ -513,52 +540,161 @@ async def process_remote_media(
                 details={"declared": attachment.size_bytes, "actual": remote_size},
             )
         attachment.etag = str(stat.get("hash") or attachment.etag or "") or None
-        attachment.mime_type = str(stat.get("mimeType") or attachment.declared_mime_type)
+        actual_mime_type = str(stat.get("mimeType") or "").split(";", 1)[0].strip().lower()
+        allowed_types = (
+            ALLOWED_IMAGE_MIME_TYPES
+            if attachment.media_type == "image"
+            else ALLOWED_VIDEO_MIME_TYPES
+        )
+        if (
+            actual_mime_type != attachment.declared_mime_type
+            or actual_mime_type not in allowed_types
+        ):
+            attachment.metadata_status = "rejected"
+            attachment.rejection_reason = "DECLARED_MIME_MISMATCH"
+            raise ApiError(415, "DECLARED_MIME_MISMATCH", "七牛云对象 MIME 与上传声明不一致")
+        attachment.mime_type = actual_mime_type
     else:
         attachment.mime_type = attachment.declared_mime_type
     attachment.malware_scan_status = "clean"
-    attachment.metadata_status = "ready"
-    attachment.processing_progress = 100
     attachment.rejection_reason = None
     public_base = settings.qiniu_public_base_url.rstrip("/")
     if attachment.media_type == "image":
-        attachment.ocr_status = "unavailable"
+        attachment.ocr_status = "not_applicable"
+        attachment.ocr_text = None
         attachment.vision_status = "unavailable"
         if is_real_kodo:
             attachment.vision_summary = None
-            # OCR/vision remain degradable: enrichment failure never rejects evidence.
-            try:
-                image_bytes = await fetch_object_bytes(
-                    attachment.object_key,
-                    max_bytes=settings.max_image_bytes,
-                    settings=settings,
+            fetch_key = attachment.object_key
+            verify_original_sha256 = attachment.size_bytes <= settings.max_image_bytes
+            if not verify_original_sha256:
+                fetch_key = (
+                    f"{attachment.object_key}?imageView2/2/w/1280/h/1280/format/jpg"
                 )
+                attachment.sha256 = None
+            image_bytes = await fetch_object_bytes(
+                fetch_key,
+                max_bytes=settings.max_image_bytes,
+                settings=settings,
+            )
+            if verify_original_sha256:
                 actual_sha256 = hashlib.sha256(image_bytes).hexdigest()
                 if actual_sha256 != attachment.expected_sha256:
-                    raise ApiError(422, "UPLOAD_HASH_MISMATCH", "七牛云对象哈希与声明不一致")
+                    attachment.metadata_status = "rejected"
+                    attachment.rejection_reason = "UPLOAD_HASH_MISMATCH"
+                    raise ApiError(
+                        422,
+                        "UPLOAD_HASH_MISMATCH",
+                        "七牛云对象哈希与声明不一致",
+                    )
+                attachment.sha256 = actual_sha256
+            try:
+                image_bytes = await asyncio.to_thread(
+                    _validated_visual_bytes,
+                    image_bytes,
+                    settings,
+                )
+            except ApiError as exc:
+                attachment.metadata_status = "rejected"
+                attachment.rejection_reason = exc.code
+                raise
+            try:
                 from .ai import enrich_attachment
 
                 await enrich_attachment(session, attachment, settings, image_bytes=image_bytes)
             except Exception as exc:
-                attachment.ocr_status = "failed"
+                # Visual interpretation is degradable after hash/MIME/safe-decode checks pass.
+                attachment.ocr_status = "not_applicable"
+                attachment.ocr_text = None
                 attachment.vision_status = "failed"
                 attachment.vision_summary = f"AI enrichment unavailable: {type(exc).__name__}"
         else:
-            attachment.vision_summary = "Mock Kodo image processing completed"
+            attachment.vision_summary = None
     else:
         attachment.ocr_status = "not_applicable"
+        attachment.ocr_text = None
         attachment.vision_status = "unavailable"
         attachment.transcript_status = "unavailable"
-        attachment.transcode_status = "ready"
-        attachment.keyframe_status = "ready"
         if is_real_kodo:
-            attachment.cover_path = f"{public_base}/{attachment.object_key}?vframe/jpg/offset/1"
+            try:
+                avinfo_bytes = await fetch_object_bytes(
+                    f"{attachment.object_key}?avinfo",
+                    max_bytes=1024 * 1024,
+                    settings=settings,
+                )
+            except ApiError as exc:
+                attachment.metadata_status = "rejected"
+                attachment.keyframe_status = "failed"
+                attachment.rejection_reason = exc.code
+                raise
+            try:
+                avinfo = json.loads(avinfo_bytes)
+                duration_ms = int(float(avinfo["format"]["duration"]) * 1000)
+                streams = avinfo.get("streams", [])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                attachment.metadata_status = "rejected"
+                attachment.keyframe_status = "failed"
+                attachment.rejection_reason = "VIDEO_METADATA_INVALID"
+                raise ApiError(422, "VIDEO_METADATA_INVALID", "无法读取可信的视频元数据") from exc
+            if duration_ms <= 0 or not any(
+                isinstance(stream, dict) and stream.get("codec_type") == "video"
+                for stream in streams
+            ):
+                attachment.metadata_status = "rejected"
+                attachment.keyframe_status = "failed"
+                attachment.rejection_reason = "VIDEO_METADATA_INVALID"
+                raise ApiError(422, "VIDEO_METADATA_INVALID", "上传对象不包含可读取的视频流")
+            if duration_ms > settings.media_max_video_duration_ms:
+                attachment.metadata_status = "rejected"
+                attachment.keyframe_status = "failed"
+                attachment.rejection_reason = "VIDEO_DURATION_EXCEEDED"
+                raise ApiError(
+                    413,
+                    "VIDEO_DURATION_EXCEEDED",
+                    "视频时长超过当前技术策略",
+                    details={"max_video_duration_ms": settings.media_max_video_duration_ms},
+                )
+            attachment.duration_ms = duration_ms
+            keyframes: list[bytes] = []
+            for offset in _video_keyframe_offsets(duration_ms):
+                try:
+                    frame = await fetch_object_bytes(
+                        f"{attachment.object_key}?vframe/jpg/offset/{offset:g}",
+                        max_bytes=settings.max_image_bytes,
+                        settings=settings,
+                    )
+                except ApiError as exc:
+                    attachment.metadata_status = "rejected"
+                    attachment.keyframe_status = "failed"
+                    attachment.rejection_reason = exc.code
+                    raise
+                try:
+                    keyframes.append(
+                        await asyncio.to_thread(_validated_visual_bytes, frame, settings)
+                    )
+                except ApiError as exc:
+                    attachment.metadata_status = "rejected"
+                    attachment.keyframe_status = "failed"
+                    attachment.rejection_reason = exc.code
+                    raise
+            if not keyframes:
+                attachment.metadata_status = "rejected"
+                attachment.keyframe_status = "failed"
+                attachment.rejection_reason = "VIDEO_KEYFRAME_UNAVAILABLE"
+                raise ApiError(422, "VIDEO_KEYFRAME_UNAVAILABLE", "视频没有可安全读取的关键帧")
+            attachment.transcode_status = "ready"
+            attachment.keyframe_status = "ready"
+            attachment.cover_path = f"{public_base}/{attachment.object_key}?vframe/jpg/offset/0"
             attachment.preview_path = f"{public_base}/{attachment.object_key}"
             attachment.vision_summary = None
         else:
-            attachment.cover_path = f"{public_base}/{attachment.object_key}.cover.jpg"
+            attachment.transcode_status = "unavailable"
+            attachment.keyframe_status = "unavailable"
+            attachment.cover_path = None
             attachment.preview_path = f"{public_base}/{attachment.object_key}"
-            attachment.vision_summary = "Mock Kodo video processing completed"
+            attachment.vision_summary = None
+    attachment.metadata_status = "ready"
+    attachment.processing_progress = 100
     return attachment
 
 
@@ -820,14 +956,16 @@ async def process_attachment(
         else:
             attachment.source_cluster_id = attachment.id
         # OCR/vision are explicitly degradable; failed enrichment never rejects safe evidence.
-        attachment.ocr_status = "unavailable"
+        attachment.ocr_status = "not_applicable"
+        attachment.ocr_text = None
         attachment.vision_status = "unavailable"
         try:
             from .ai import enrich_attachment
 
             await enrich_attachment(session, attachment, settings)
         except Exception as exc:
-            attachment.ocr_status = "failed"
+            attachment.ocr_status = "not_applicable"
+            attachment.ocr_text = None
             attachment.vision_status = "failed"
             attachment.vision_summary = f"AI enrichment unavailable: {type(exc).__name__}"
         return attachment

@@ -10,7 +10,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from crisis_mosaic.config import Settings
+from crisis_mosaic.config import Settings, get_settings
 from crisis_mosaic.errors import ApiError
 from crisis_mosaic.models import (
     AiAnalysis,
@@ -21,6 +21,7 @@ from crisis_mosaic.models import (
     ConflictCase,
     ConflictEvidence,
     Incident,
+    Report,
 )
 from crisis_mosaic.schemas.ai import (
     BriefRecommendation,
@@ -29,7 +30,6 @@ from crisis_mosaic.schemas.ai import (
     EvidenceAssessment,
     MediaEvidenceExtractionOutput,
     MediaObservation,
-    MediaOcrItem,
     ReportRefinementOutput,
     ReportRefinementRequest,
 )
@@ -37,10 +37,12 @@ from crisis_mosaic.schemas.uploads import ImageIntentRequest
 from crisis_mosaic.security import Actor
 from crisis_mosaic.services.ai import (
     _media_evidence_to_attachment_output,
+    _read_report_attachment_visual,
     _validate_command_brief_contract,
     _validate_media_evidence_contract,
     _validate_report_refinement_contract,
     build_conflict_context,
+    build_report_refinement_context,
     enqueue_conflict_analysis,
     ensure_ai_available,
     process_analysis,
@@ -50,6 +52,7 @@ from crisis_mosaic.services.ai_prompts import (
     CONFLICT_ANALYSIS_PROMPT_VERSION,
     REPORT_REFINEMENT_PROMPT_VERSION,
 )
+from crisis_mosaic.services.attachments import serialize_attachment
 from crisis_mosaic.services.uploads import (
     attachment_state,
     process_attachment,
@@ -100,6 +103,34 @@ def test_report_refinement_allows_number_adjustments() -> None:
     _validate_report_refinement_contract(request, output)
 
 
+def test_report_refinement_attachment_request_contract_is_bounded() -> None:
+    with pytest.raises(ValidationError, match="duplicates"):
+        ReportRefinementRequest(
+            incident_id="incident",
+            category="rescue",
+            content="需要帮助",
+            location_text="东桥",
+            attachment_ids=["same", "same"],
+        )
+    with pytest.raises(ValidationError, match="provided together"):
+        ReportRefinementRequest(
+            incident_id="incident",
+            category="rescue",
+            content="需要帮助",
+            location_text="东桥",
+            report_id="report",
+        )
+    limit = get_settings().media_max_attachment_count
+    with pytest.raises(ValidationError, match="configured media attachment count"):
+        ReportRefinementRequest(
+            incident_id="incident",
+            category="rescue",
+            content="需要帮助",
+            location_text="东桥",
+            attachment_ids=[f"attachment-{index}" for index in range(limit + 1)],
+        )
+
+
 def test_media_evidence_output_maps_to_attachment_fields() -> None:
     attachment = Attachment(
         id="01900000-0000-7000-8000-000000000101",
@@ -116,7 +147,6 @@ def test_media_evidence_output_maps_to_attachment_fields() -> None:
         evidence_id=attachment.id,
         read_status="partially_readable",
         modality="image",
-        ocr_items=[MediaOcrItem(frame_ref="image", text="水深约2米", confidence=0.7)],
         observations=[
             MediaObservation(
                 frame_ref="image",
@@ -129,7 +159,7 @@ def test_media_evidence_output_maps_to_attachment_fields() -> None:
         time_clues=["傍晚"],
         risk_signals=["道路积水"],
         manipulation_signals=["局部低清晰度"],
-        summary="画面显示道路积水，部分文字可读。",
+        summary="画面显示道路积水，部分区域清晰度较低。",
         limitations=["无法判断水流速度"],
         confidence=0.72,
     )
@@ -137,9 +167,42 @@ def test_media_evidence_output_maps_to_attachment_fields() -> None:
     _validate_media_evidence_contract(attachment, output)
     folded = _media_evidence_to_attachment_output(output)
 
-    assert folded.ocr_text == "水深约2米"
+    assert folded.vision_summary.startswith("[vision_policy:no_text_v1]")
     assert "画面观察" in folded.vision_summary
     assert "局部低清晰度" in folded.vision_summary
+
+
+def test_media_evidence_schema_has_no_ocr_fields() -> None:
+    schema = MediaEvidenceExtractionOutput.model_json_schema()
+
+    assert "ocr_items" not in schema["properties"]
+    assert "MediaOcrItem" not in schema.get("$defs", {})
+
+
+def test_attachment_serialization_hides_legacy_text_bearing_summaries() -> None:
+    attachment = Attachment(
+        id="01900000-0000-7000-8000-000000000102",
+        incident_id="incident",
+        uploader_device_id="device",
+        file_name="scene.jpg",
+        declared_mime_type="image/jpeg",
+        size_bytes=100,
+        expected_sha256="0" * 64,
+        media_type="image",
+        upload_expires_at=utcnow(),
+        vision_summary="旧摘要可能包含画面文字",
+        ocr_status="ready",
+        ocr_text="旧画面文字",
+    )
+
+    hidden = serialize_attachment(attachment)
+    assert hidden["ocr_status"] == "not_applicable"
+    assert hidden["ocr_text"] is None
+    assert hidden["vision_summary"] is None
+
+    attachment.vision_summary = "[vision_policy:no_text_v1]\n画面可见道路积水"
+    safe = serialize_attachment(attachment)
+    assert safe["vision_summary"] == "画面可见道路积水"
 
 
 @pytest.mark.asyncio
@@ -326,6 +389,339 @@ def test_report_refinement_rejects_unknown_or_duplicate_risk_tags() -> None:
             detected_risk_tags=["trapped_people", "trapped_people"],
             confidence=0.8,
         )
+
+
+@pytest.mark.asyncio
+async def test_report_refinement_context_sends_owned_visuals_without_ocr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'refinement-media.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    settings = Settings(
+        app_env="test",
+        ai_provider="fake",
+        storage_root=tmp_path / "uploads",
+        max_attachments_per_report=5,
+        media_max_parallel_uploads=2,
+    )
+    settings.ensure_directories()
+    thumbnail = settings.storage_root / "thumbnails" / "scene.jpg"
+    thumbnail.parent.mkdir(parents=True, exist_ok=True)
+    thumbnail.write_bytes(image_bytes())
+    fetched_keys: list[str] = []
+
+    async def fake_fetch(
+        object_key: str,
+        *,
+        max_bytes: int,
+        settings: Settings,
+    ) -> bytes:
+        del max_bytes, settings
+        fetched_keys.append(object_key)
+        return image_bytes()
+
+    monkeypatch.setattr("crisis_mosaic.services.ai.fetch_object_bytes", fake_fetch)
+    actor = Actor(
+        subject_type="device",
+        subject_id="device",
+        role="resident",
+        token_version=1,
+        incident_ids=frozenset({"incident"}),
+    )
+    async with maker() as session:
+        incident = Incident(id="incident", name="Test", status="active")
+        report = Report(
+            id="report",
+            incident_id=incident.id,
+            reporter_device_id=actor.subject_id,
+            category="rescue",
+            content_original="有人需要救援",
+            content_display="有人需要救援",
+            location_text="东桥",
+            revision=2,
+        )
+        image = Attachment(
+            id="image",
+            incident_id=incident.id,
+            uploader_device_id=actor.subject_id,
+            report_id=report.id,
+            file_name="scene.jpg",
+            declared_mime_type="image/jpeg",
+            media_type="image",
+            storage_provider="local_proxy",
+            size_bytes=100,
+            expected_sha256="1" * 64,
+            sha256="1" * 64,
+            thumbnail_path=str(thumbnail),
+            metadata_status="ready",
+            malware_scan_status="clean",
+            ocr_status="ready",
+            ocr_text="不得进入上下文的历史 OCR 文本",
+            vision_status="succeeded",
+            vision_summary="旧视觉摘要可能包含画面文字，不得复用",
+            upload_expires_at=utcnow(),
+        )
+        video = Attachment(
+            id="video",
+            incident_id=incident.id,
+            uploader_device_id=actor.subject_id,
+            report_id=report.id,
+            file_name="scene.mp4",
+            declared_mime_type="video/mp4",
+            media_type="video",
+            storage_provider="qiniu_kodo",
+            object_key="safe/video.mp4",
+            size_bytes=1000,
+            expected_sha256="2" * 64,
+            sha256=None,
+            etag="server-etag",
+            duration_ms=10_000,
+            metadata_status="ready",
+            malware_scan_status="clean",
+            vision_status="unavailable",
+            transcript_status="succeeded",
+            transcript_text="音轨中有人呼救",
+            keyframe_status="ready",
+            upload_expires_at=utcnow(),
+        )
+        session.add_all([incident, report, image, video])
+        await session.commit()
+
+        request = ReportRefinementRequest(
+            incident_id=incident.id,
+            report_id=report.id,
+            report_revision=report.revision,
+            category="rescue",
+            content="有人需要救援",
+            location_text="东桥",
+            attachment_ids=[image.id, video.id],
+        )
+        context, visuals = await build_report_refinement_context(
+            session, request, actor, settings
+        )
+
+        serialized = canonical_json(context)
+        assert "不得进入上下文的历史 OCR 文本" not in serialized
+        assert "旧视觉摘要可能包含画面文字" not in serialized
+        assert "ocr_text" not in serialized
+        assert context["attachments"][1]["transcript_text"] == "音轨中有人呼救"
+        assert context["attachments"][0]["model_image_indices"] == [1]
+        assert context["attachments"][1]["model_image_indices"] == [2, 3, 4]
+        assert len(visuals) == 4
+        assert len(fetched_keys) == 3
+
+        with pytest.raises(ApiError, match="报告上下文不存在或已过期"):
+            await build_report_refinement_context(
+                session,
+                request.model_copy(update={"report_revision": 1}),
+                actor,
+                settings,
+            )
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_report_refinement_attempts_all_requested_images_with_independent_frame_cap(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'all-media.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    settings = Settings(
+        app_env="test",
+        ai_provider="fake",
+        storage_root=tmp_path / "uploads",
+        max_attachments_per_report=5,
+        max_image_bytes=10 * 1024 * 1024,
+    )
+    settings.ensure_directories()
+    actor = Actor(
+        subject_type="device",
+        subject_id="device",
+        role="resident",
+        token_version=1,
+        incident_ids=frozenset({"incident"}),
+    )
+    image_contents = [b"small-image"] * 6
+    image_contents[0] = b"x" * (750 * 1024)
+    attachments: list[Attachment] = []
+    for index, content in enumerate(image_contents):
+        path = settings.storage_root / "thumbnails" / f"scene-{index}.jpg"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        attachments.append(
+            Attachment(
+                id=f"image-{index}",
+                incident_id="incident",
+                uploader_device_id=actor.subject_id,
+                file_name=path.name,
+                declared_mime_type="image/jpeg",
+                media_type="image",
+                storage_provider="local_proxy",
+                size_bytes=len(content),
+                expected_sha256=str(index) * 64,
+                thumbnail_path=str(path),
+                metadata_status="ready",
+                malware_scan_status="clean",
+                vision_status="unavailable",
+                upload_expires_at=utcnow(),
+            )
+        )
+
+    async with maker() as session:
+        session.add(Incident(id="incident", name="Test", status="active"))
+        session.add_all(attachments)
+        await session.commit()
+        request = ReportRefinementRequest(
+            incident_id="incident",
+            category="rescue",
+            content="Need help",
+            location_text="Bridge",
+            attachment_ids=[item.id for item in attachments],
+        )
+
+        context, visuals = await build_report_refinement_context(
+            session, request, actor, settings
+        )
+
+    assert len(visuals[0]) > 699 * 1024
+    assert context["attachments"][0]["model_image_indices"] == [1]
+    assert context["attachments"][5]["model_image_indices"] == [6]
+    assert len(visuals) == 6
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_report_refinement_allocates_video_frames_round_robin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'round-robin.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    settings = Settings(
+        app_env="test",
+        ai_provider="fake",
+        storage_root=tmp_path / "uploads",
+        max_image_bytes=800,
+    )
+    settings.ensure_directories()
+    actor = Actor(
+        subject_type="device",
+        subject_id="device",
+        role="resident",
+        token_version=1,
+        incident_ids=frozenset({"incident"}),
+    )
+
+    async def fake_read_visual(
+        attachment: Attachment,
+        settings: Settings,
+        *,
+        max_bytes_per_frame: int,
+    ) -> tuple[list[bytes], str | None]:
+        del settings
+        assert max_bytes_per_frame == 800
+        return [attachment.id.encode() * 200] * 3, None
+
+    monkeypatch.setattr(
+        "crisis_mosaic.services.ai._read_report_attachment_visual", fake_read_visual
+    )
+    videos = [
+        Attachment(
+            id=f"v{index}",
+            incident_id="incident",
+            uploader_device_id=actor.subject_id,
+            file_name=f"v{index}.mp4",
+            declared_mime_type="video/mp4",
+            media_type="video",
+            storage_provider="qiniu_kodo",
+            object_key=f"v{index}.mp4",
+            size_bytes=100,
+            expected_sha256=str(index) * 64,
+            duration_ms=10_000,
+            metadata_status="ready",
+            malware_scan_status="clean",
+            keyframe_status="ready",
+            vision_status="unavailable",
+            upload_expires_at=utcnow(),
+        )
+        for index in range(2)
+    ]
+    async with maker() as session:
+        session.add(Incident(id="incident", name="Test", status="active"))
+        session.add_all(videos)
+        await session.commit()
+        request = ReportRefinementRequest(
+            incident_id="incident",
+            category="rescue",
+            content="Need help",
+            location_text="Bridge",
+            attachment_ids=[item.id for item in videos],
+        )
+
+        context, visuals = await build_report_refinement_context(
+            session, request, actor, settings
+        )
+
+    assert len(visuals) == 2
+    assert context["attachments"][0]["model_image_indices"] == [1]
+    assert context["attachments"][1]["model_image_indices"] == [2]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_video_visual_read_keeps_successful_frames_when_one_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(app_env="test", ai_provider="fake")
+    attachment = Attachment(
+        id="video",
+        incident_id="incident",
+        uploader_device_id="device",
+        file_name="video.mp4",
+        declared_mime_type="video/mp4",
+        media_type="video",
+        storage_provider="qiniu_kodo",
+        object_key="video.mp4",
+        size_bytes=100,
+        expected_sha256="1" * 64,
+        duration_ms=10_000,
+        metadata_status="ready",
+        malware_scan_status="clean",
+        keyframe_status="ready",
+        vision_status="unavailable",
+        upload_expires_at=utcnow(),
+    )
+
+    async def fake_fetch(
+        object_key: str,
+        *,
+        max_bytes: int,
+        settings: Settings,
+    ) -> bytes:
+        del max_bytes, settings
+        if "offset/5" in object_key:
+            raise ApiError(502, "FRAME_FETCH_FAILED", "frame failed")
+        return object_key.encode()
+
+    monkeypatch.setattr("crisis_mosaic.services.ai.fetch_object_bytes", fake_fetch)
+
+    frames, limitation = await _read_report_attachment_visual(
+        attachment,
+        settings,
+        max_bytes_per_frame=2 * 1024 * 1024,
+    )
+
+    assert len(frames) == 2
+    assert limitation is not None
+    assert "partial" in limitation
+    assert "FRAME_FETCH_FAILED" in limitation
 
 
 def test_command_brief_rejects_source_refs_outside_snapshot_whitelist() -> None:
@@ -564,7 +960,7 @@ async def test_conflict_context_has_observation_timeline_steps_and_stable_cache(
         assert {
             "evidence_collection",
             "image_safety_and_deduplication",
-            "ocr_and_vision_context",
+            "vision_context",
             "text_normalization",
             "timeline_alignment",
             "context_persistence",
@@ -583,6 +979,20 @@ async def test_conflict_context_has_observation_timeline_steps_and_stable_cache(
         )
         assert cached.id == analysis.id
         assert conflict.status == "analysis_ready"
+
+        analysis.prompt_version = "cm-conflict-analysis-v1.0.0"
+        conflict.status = "open"
+        await session.flush()
+        refreshed = await enqueue_conflict_analysis(
+            session,
+            conflict=conflict,
+            revision=1,
+            evidence_ids=None,
+            actor=actor,
+            settings=settings,
+        )
+        assert refreshed.id != analysis.id
+        assert refreshed.prompt_version == CONFLICT_ANALYSIS_PROMPT_VERSION
     await engine.dispose()
 
 

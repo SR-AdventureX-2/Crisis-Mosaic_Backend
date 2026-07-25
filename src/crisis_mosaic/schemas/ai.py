@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ..config import get_settings
+
 RiskTag = Literal[
     "trapped_people",
     "missing_people",
@@ -54,6 +56,26 @@ class ReportRefinementRequest(BaseModel):
     category: Literal["rescue", "medical", "water", "food", "shelter", "road"]
     content: str = Field(min_length=1, max_length=300)
     location_text: str = Field(min_length=1, max_length=300)
+    attachment_ids: list[str] = Field(default_factory=list)
+    report_id: str | None = None
+    report_revision: int | None = Field(default=None, ge=1)
+
+    @field_validator("attachment_ids")
+    @classmethod
+    def validate_unique_attachment_ids(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("attachment_ids must not contain duplicates")
+        if len(value) > get_settings().media_max_attachment_count:
+            raise ValueError(
+                "attachment_ids must not exceed the configured media attachment count"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_report_context_pair(self) -> ReportRefinementRequest:
+        if (self.report_id is None) != (self.report_revision is None):
+            raise ValueError("report_id and report_revision must be provided together")
+        return self
 
 
 class ReportRefinementOutput(BaseModel):
@@ -103,16 +125,7 @@ class ReportRefinementResponse(ReportRefinementOutput):
 class AttachmentEnrichmentOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    ocr_text: str = Field(max_length=10000)
     vision_summary: str = Field(min_length=1, max_length=3000)
-
-
-class MediaOcrItem(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    frame_ref: str
-    text: str
-    confidence: float = Field(ge=0, le=1)
 
 
 class MediaObservation(BaseModel):
@@ -130,7 +143,6 @@ class MediaEvidenceExtractionOutput(BaseModel):
     evidence_id: str = Field(min_length=1)
     read_status: Literal["readable", "partially_readable", "unreadable"]
     modality: Literal["image", "video"]
-    ocr_items: list[MediaOcrItem] = Field(max_length=50)
     observations: list[MediaObservation] = Field(max_length=50)
     location_clues: list[str] = Field(max_length=20)
     time_clues: list[str] = Field(max_length=20)
@@ -146,7 +158,7 @@ class ConflictProcessingOptions(BaseModel):
 
     read_original_text: bool = True
     read_images: bool = True
-    extract_ocr: bool = True
+    extract_ocr: Literal[False] = False
     verify_file_hash: bool = True
     cross_validate_timeline: bool = True
 
@@ -166,7 +178,7 @@ class ConflictAnalysisRequest(BaseModel):
                     "processing": {
                         "read_original_text": True,
                         "read_images": True,
-                        "extract_ocr": True,
+                        "extract_ocr": False,
                         "verify_file_hash": True,
                         "cross_validate_timeline": True,
                     },

@@ -51,6 +51,8 @@ from ..services.ai_prompts import (
 )
 from ..services.events import emit_event, record_audit
 from ..services.map_features import upsert_conflict_map_feature
+from ..services.qiniu import fetch_object_bytes
+from ..services.reports import load_bindable_attachments
 from ..utils import canonical_json, sha256_text, utcnow
 
 
@@ -192,8 +194,11 @@ def _sum_tokens(left: int | None, right: int | None) -> int | None:
     return (left or 0) + (right or 0)
 
 
-def _report_input_payload(request: ReportRefinementRequest) -> dict[str, Any]:
-    return {
+def _report_input_payload(
+    request: ReportRefinementRequest,
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "request_context": {
             "incident_id": request.incident_id,
             "language": "zh-CN",
@@ -205,6 +210,290 @@ def _report_input_payload(request: ReportRefinementRequest) -> dict[str, Any]:
             "location_text": request.location_text,
         },
     }
+    if request.report_id is not None:
+        payload["request_context"].update(
+            {
+                "report_id": request.report_id,
+                "report_revision": request.report_revision,
+            }
+        )
+    if attachments is not None:
+        payload["attachments"] = attachments
+    return payload
+
+
+_READY_MEDIA_STATUSES = frozenset({"ready", "succeeded"})
+_NO_TEXT_VISION_PREFIX = "[vision_policy:no_text_v1]\n"
+
+
+def _available_media_text(status: str | None, value: str | None, max_length: int) -> str | None:
+    if status not in _READY_MEDIA_STATUSES or not value:
+        return None
+    return _truncate_text(value, max_length)
+
+
+def _report_attachment_context(attachment: Attachment) -> dict[str, Any]:
+    limitations: list[str] = []
+    vision_summary = None
+    if attachment.vision_summary and attachment.vision_summary.startswith(
+        _NO_TEXT_VISION_PREFIX
+    ):
+        vision_summary = _available_media_text(
+            attachment.vision_status,
+            attachment.vision_summary.removeprefix(_NO_TEXT_VISION_PREFIX),
+            3000,
+        )
+    if vision_summary is None:
+        limitations.append(f"vision_status:{attachment.vision_status or 'missing'}")
+    context: dict[str, Any] = {
+        "attachment_id": attachment.id,
+        "media_type": attachment.media_type,
+        "sha256": attachment.sha256,
+        "storage_etag": attachment.etag,
+        "size_bytes": attachment.size_bytes,
+        "captured_at": attachment.captured_at.isoformat() if attachment.captured_at else None,
+        "duration_ms": attachment.duration_ms,
+        "vision_status": attachment.vision_status,
+        "vision_summary": vision_summary,
+        "raw_media_status": "pending",
+        "limitations": limitations,
+    }
+    if attachment.media_type == "video":
+        transcript = _available_media_text(
+            attachment.transcript_status,
+            attachment.transcript_text,
+            5000,
+        )
+        context["transcript_status"] = attachment.transcript_status
+        context["transcript_text"] = transcript
+        context["keyframe_status"] = attachment.keyframe_status
+        if transcript is None:
+            limitations.append(
+                f"transcript_status:{attachment.transcript_status or 'missing'}"
+            )
+    return context
+
+
+def _read_bounded_local_media(
+    path_value: str,
+    *,
+    settings: Settings,
+    max_bytes: int,
+) -> bytes:
+    storage_root = settings.storage_root.resolve()
+    try:
+        path = Path(path_value).resolve(strict=True)
+    except OSError as exc:
+        raise ApiError(503, "AI_MEDIA_READ_FAILED", "AI 无法读取已处理的媒体文件") from exc
+    if path == storage_root or storage_root not in path.parents:
+        raise ApiError(503, "AI_MEDIA_PATH_INVALID", "AI 媒体文件不在受控存储目录内")
+    try:
+        if path.stat().st_size > max_bytes:
+            raise ApiError(413, "AI_MEDIA_TOO_LARGE", "AI 媒体预览超过读取限制")
+        content = path.read_bytes()
+    except OSError as exc:
+        raise ApiError(503, "AI_MEDIA_READ_FAILED", "AI 无法读取已处理的媒体文件") from exc
+    if not content:
+        raise ApiError(503, "AI_MEDIA_READ_FAILED", "AI 媒体预览为空")
+    return content
+
+
+async def _read_report_attachment_visual(
+    attachment: Attachment,
+    settings: Settings,
+    *,
+    max_bytes_per_frame: int,
+) -> tuple[list[bytes], str | None]:
+    if attachment.media_type == "video" and attachment.keyframe_status not in _READY_MEDIA_STATUSES:
+        return [], f"keyframe_status:{attachment.keyframe_status or 'missing'}"
+    if attachment.storage_provider == "local_proxy":
+        path_value = (
+            attachment.thumbnail_path or attachment.sanitized_path
+            if attachment.media_type == "image"
+            else attachment.cover_path
+        )
+        if not path_value:
+            return [], "processed_media_path:missing"
+        try:
+            return ([
+                await asyncio.to_thread(
+                    _read_bounded_local_media,
+                    path_value,
+                    settings=settings,
+                    max_bytes=max_bytes_per_frame,
+                ),
+            ], None)
+        except ApiError as exc:
+            return [], exc.code
+    if attachment.storage_provider == "qiniu_kodo" and attachment.object_key:
+        transforms = ["imageView2/2/w/1280/h/1280/format/jpg"]
+        if attachment.media_type == "video":
+            if not attachment.duration_ms:
+                return [], "video_duration:missing"
+            transforms = [
+                f"vframe/jpg/offset/{offset:g}"
+                for offset in _video_frame_offsets(attachment.duration_ms)
+            ]
+
+            async def fetch_frame(transform: str) -> tuple[bytes | None, str | None]:
+                try:
+                    return (
+                        await fetch_object_bytes(
+                            f"{attachment.object_key}?{transform}",
+                            max_bytes=max_bytes_per_frame,
+                            settings=settings,
+                        ),
+                        None,
+                    )
+                except ApiError as exc:
+                    return None, exc.code
+
+            frame_results = await asyncio.gather(
+                *(fetch_frame(transform) for transform in transforms)
+            )
+            contents = [content for content, _ in frame_results if content is not None]
+            failure_codes = [code for _, code in frame_results if code is not None]
+            if failure_codes:
+                outcome = "partial_failure" if contents else "unavailable"
+                codes = ",".join(sorted(set(failure_codes)))
+                limitation = (
+                    f"video_keyframes:{outcome}:"
+                    f"{len(failure_codes)}/{len(frame_results)}:{codes}"
+                )
+                return contents, limitation
+            return contents, None
+        try:
+            content = await fetch_object_bytes(
+                f"{attachment.object_key}?{transforms[0]}",
+                max_bytes=max_bytes_per_frame,
+                settings=settings,
+            )
+        except ApiError as exc:
+            return [], exc.code
+        return [content], None
+    return [], "raw_media_provider:unavailable"
+
+
+def _video_frame_offsets(duration_ms: int) -> list[float]:
+    duration_seconds = max(duration_ms / 1000, 0.0)
+    candidates = (0.0, duration_seconds / 2, max(0.0, duration_seconds - 0.1))
+    return list(dict.fromkeys(round(value, 3) for value in candidates))
+
+
+async def build_report_refinement_context(
+    session: AsyncSession,
+    request: ReportRefinementRequest,
+    actor: Actor,
+    settings: Settings,
+) -> tuple[dict[str, Any], list[bytes]]:
+    bound_report_id: str | None = None
+    if request.report_id is not None:
+        report = await session.get(Report, request.report_id)
+        if (
+            report is None
+            or report.incident_id != request.incident_id
+            or report.reporter_device_id != actor.subject_id
+            or report.deleted_at is not None
+            or report.revision != request.report_revision
+        ):
+            raise ApiError(
+                422,
+                "AI_REPORT_CONTEXT_INVALID",
+                "AI 上报整理请求中的报告上下文不存在或已过期",
+        )
+        bound_report_id = report.id
+    if not request.attachment_ids:
+        return _report_input_payload(request, [] if request.report_id else None), []
+    attachments = await load_bindable_attachments(
+        session,
+        incident_id=request.incident_id,
+        uploader_device_id=actor.subject_id,
+        attachment_ids=request.attachment_ids,
+        bound_report_id=bound_report_id,
+    )
+    attachment_contexts = [_report_attachment_context(item) for item in attachments]
+    image_payloads: list[bytes] = []
+    total_byte_budget = settings.max_image_bytes
+    max_bytes_per_frame = min(total_byte_budget, 2 * 1024 * 1024)
+    semaphore = asyncio.Semaphore(max(1, settings.media_max_parallel_uploads))
+
+    async def read_visual(index: int) -> tuple[int, list[bytes], str | None]:
+        async with semaphore:
+            try:
+                frames, limitation = await asyncio.wait_for(
+                    _read_report_attachment_visual(
+                        attachments[index],
+                        settings,
+                        max_bytes_per_frame=max_bytes_per_frame,
+                    ),
+                    timeout=min(8.0, max(1.0, settings.ai_report_timeout_seconds / 3)),
+                )
+            except TimeoutError:
+                return index, [], "raw_media_read:timeout"
+            return index, frames, limitation
+
+    tasks = {
+        asyncio.create_task(read_visual(index)): index
+        for index in range(len(attachments))
+    }
+    done, pending = await asyncio.wait(
+        tasks,
+        timeout=min(15.0, max(2.0, settings.ai_report_timeout_seconds / 3)),
+    )
+    for task in pending:
+        task.cancel()
+        index = tasks[task]
+        attachment_contexts[index]["raw_media_status"] = "unavailable"
+        attachment_contexts[index]["limitations"].append("raw_media_read:timeout")
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    visual_results = {
+        index: (frames, limitation)
+        for index, frames, limitation in (task.result() for task in done)
+    }
+    model_indices_by_attachment: dict[int, list[int]] = {
+        index: [] for index in visual_results
+    }
+    used_bytes = 0
+    max_frame_count = max(
+        (len(frames) for frames, _ in visual_results.values()),
+        default=0,
+    )
+    for frame_index in range(max_frame_count):
+        for index in sorted(visual_results):
+            frames, _ = visual_results[index]
+            if frame_index >= len(frames):
+                continue
+            frame = frames[frame_index]
+            context = attachment_contexts[index]
+            if used_bytes + len(frame) > total_byte_budget:
+                budget_limitation = "raw_media:omitted_total_byte_budget"
+                if budget_limitation not in context["limitations"]:
+                    context["limitations"].append(budget_limitation)
+                continue
+            used_bytes += len(frame)
+            image_payloads.append(frame)
+            model_indices_by_attachment[index].append(len(image_payloads))
+
+    for index in sorted(visual_results):
+        frames, limitation = visual_results[index]
+        context = attachment_contexts[index]
+        model_indices = model_indices_by_attachment[index]
+        if model_indices:
+            context["raw_media_status"] = (
+                "loaded"
+                if len(model_indices) == len(frames) and limitation is None
+                else "partially_loaded"
+            )
+            context["model_image_indices"] = model_indices
+            context["model_image_kind"] = (
+                "image" if attachments[index].media_type == "image" else "video_keyframe"
+            )
+        else:
+            context["raw_media_status"] = "unavailable"
+        if limitation:
+            context["limitations"].append(limitation)
+    return _report_input_payload(request, attachment_contexts), image_payloads
 
 
 def _prompt_hash_for(purpose: str, output_model: type[BaseModel]) -> str:
@@ -706,7 +995,7 @@ def _validate_report_refinement_contract(
 
 
 def _validate_attachment_enrichment_contract(output: AttachmentEnrichmentOutput) -> None:
-    text = f"{output.ocr_text}\n{output.vision_summary}"
+    text = output.vision_summary
     if _has_pii(text) or _contains_completion_phrase(text):
         raise ApiError(
             502,
@@ -725,7 +1014,6 @@ def _media_evidence_text(output: MediaEvidenceExtractionOutput) -> str:
         *output.manipulation_signals,
         *output.limitations,
     ]
-    chunks.extend(item.text for item in output.ocr_items)
     chunks.extend(item.fact for item in output.observations)
     return "\n".join(chunks)
 
@@ -746,8 +1034,7 @@ def _validate_media_evidence_contract(
             "AI 媒体提取输出改变了媒体类型",
         )
     if output.read_status == "unreadable" and (
-        output.ocr_items
-        or output.observations
+        output.observations
         or output.location_clues
         or output.time_clues
         or output.risk_signals
@@ -777,7 +1064,6 @@ def _truncate_text(value: str, max_length: int) -> str:
 def _media_evidence_to_attachment_output(
     output: MediaEvidenceExtractionOutput,
 ) -> AttachmentEnrichmentOutput:
-    ocr_text = "\n".join(item.text for item in output.ocr_items)
     observation_lines = [
         f"- {item.fact}（frame_ref={item.frame_ref}, confidence={item.confidence:.2f}）"
         for item in output.observations
@@ -801,8 +1087,8 @@ def _media_evidence_to_attachment_output(
         sections.append("局限性：" + "；".join(output.limitations))
     sections.append(f"置信度：{output.confidence:.2f}")
     return AttachmentEnrichmentOutput(
-        ocr_text=_truncate_text(ocr_text, 10000),
-        vision_summary=_truncate_text("\n".join(sections), 3000),
+        vision_summary=_NO_TEXT_VISION_PREFIX
+        + _truncate_text("\n".join(sections), 3000 - len(_NO_TEXT_VISION_PREFIX)),
     )
 
 
@@ -839,17 +1125,26 @@ async def refine_report(
     ensure_ai_available(settings)
     started = time.perf_counter()
     prompt_digest = _prompt_hash_for("report_refinement", ReportRefinementOutput)
+    report_payload, image_payloads = await build_report_refinement_context(
+        session,
+        request,
+        actor,
+        settings,
+    )
     analysis = AiAnalysis(
         incident_id=request.incident_id,
         analysis_type="report_refinement",
         status="running",
-        input_snapshot=_report_input_payload(request),
+        input_snapshot=report_payload,
+        context_package=report_payload,
+        context_sha256=sha256_text(canonical_json(report_payload)),
         prompt_version=REPORT_REFINEMENT_PROMPT_VERSION,
         prompt_sha256=prompt_digest,
         created_by_type=actor.subject_type,
         created_by_id=actor.subject_id,
         model_provider=settings.ai_provider,
         model_name=settings.ai_report_model,
+        input_version=request.report_revision or 0,
         data_as_of=utcnow(),
     )
     incident: Incident
@@ -867,7 +1162,11 @@ async def refine_report(
             name="model_call",
             status="running",
             started_at=utcnow(),
-            details={"model": settings.ai_report_model},
+            details={
+                "model": settings.ai_report_model,
+                "attachment_count": len(request.attachment_ids),
+                "visual_input_count": len(image_payloads),
+            },
         )
         session.add(model_step)
 
@@ -916,11 +1215,12 @@ async def refine_report(
         invocation = await asyncio.wait_for(
             _invoke_structured(
                 purpose="report_refinement",
-                payload=_report_input_payload(request),
+                payload=report_payload,
                 output_model=ReportRefinementOutput,
                 model=settings.ai_report_model,
                 timeout_seconds=settings.ai_report_timeout_seconds,
                 settings=settings,
+                image_payloads=image_payloads,
             ),
             timeout=settings.ai_report_timeout_seconds,
         )
@@ -1041,14 +1341,19 @@ async def build_conflict_context(
         }
         if row.kind in {"attachment", "image"}:
             attachment = await session.get(Attachment, row.source_id)
+            safe_vision_summary = None
+            if attachment and attachment.vision_summary and attachment.vision_summary.startswith(
+                _NO_TEXT_VISION_PREFIX
+            ):
+                safe_vision_summary = attachment.vision_summary.removeprefix(
+                    _NO_TEXT_VISION_PREFIX
+                )
             item["image"] = {
                 "status": "ready" if attachment and attachment.sanitized_path else "unreadable",
                 "sha256": attachment.sha256 if attachment else None,
                 "perceptual_hash": attachment.perceptual_hash if attachment else None,
-                "ocr_status": attachment.ocr_status if attachment else "missing",
-                "ocr_text": attachment.ocr_text if attachment else None,
                 "vision_status": attachment.vision_status if attachment else "missing",
-                "vision_summary": attachment.vision_summary if attachment else None,
+                "vision_summary": safe_vision_summary,
                 "width": attachment.width if attachment else None,
                 "height": attachment.height if attachment else None,
             }
@@ -1172,14 +1477,8 @@ async def enqueue_conflict_analysis(
     _add_completed_step(
         session,
         analysis.id,
-        "ocr_and_vision_context",
+        "vision_context",
         {
-            "ocr_ready_count": sum(
-                1
-                for item in image_evidence
-                if isinstance(item.get("image"), dict)
-                and item["image"].get("ocr_status") == "succeeded"
-            ),
             "vision_ready_count": sum(
                 1
                 for item in image_evidence
@@ -2078,18 +2377,18 @@ async def enrich_attachment(
     image_bytes: bytes | None = None,
 ) -> None:
     settings = settings or get_settings()
+    attachment.ocr_status = "not_applicable"
+    attachment.ocr_text = None
     if not settings.ai_configured:
-        attachment.ocr_status = "unavailable"
         attachment.vision_status = "unavailable"
         return
     if settings.ai_provider == "fake":
-        attachment.ocr_status = "succeeded"
-        attachment.ocr_text = ""
         attachment.vision_status = "succeeded"
-        attachment.vision_summary = "测试图片已安全解码，未配置真实视觉内容。"
+        attachment.vision_summary = (
+            _NO_TEXT_VISION_PREFIX + "测试图片已安全解码，未配置真实视觉内容。"
+        )
         return
     if image_bytes is None and not attachment.sanitized_path:
-        attachment.ocr_status = "failed"
         attachment.vision_status = "failed"
         return
     try:
@@ -2122,10 +2421,7 @@ async def enrich_attachment(
         result = _media_evidence_to_attachment_output(media_result)
         _validate_attachment_enrichment_contract(result)
     except Exception:
-        attachment.ocr_status = "failed"
         attachment.vision_status = "failed"
         raise
-    attachment.ocr_text = result.ocr_text
     attachment.vision_summary = result.vision_summary
-    attachment.ocr_status = "succeeded"
     attachment.vision_status = "succeeded"

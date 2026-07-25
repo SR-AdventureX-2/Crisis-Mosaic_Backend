@@ -8,12 +8,13 @@ import httpx
 import pytest
 import respx
 from PIL import Image
+from pydantic import ValidationError
 
 from crisis_mosaic.config import Settings, get_settings
 from crisis_mosaic.errors import ApiError
 from crisis_mosaic.main import create_app
 from crisis_mosaic.middleware import redact
-from crisis_mosaic.schemas.ai import ReportRefinementOutput
+from crisis_mosaic.schemas.ai import ConflictProcessingOptions, ReportRefinementOutput
 from crisis_mosaic.services.ai import _invoke_structured
 from crisis_mosaic.services.ai_prompts import REPORT_REFINEMENT_PROMPT_VERSION, get_prompt_spec
 from crisis_mosaic.services.uploads import _sanitize_image
@@ -47,6 +48,20 @@ def test_prompt_specs_render_task_specific_placeholders() -> None:
         rendered = get_prompt_spec(purpose).render_user_prompt(payload)
         assert payload in rendered
         assert "{{" not in rendered
+
+
+def test_visual_ai_contract_disables_ocr() -> None:
+    assert ConflictProcessingOptions().extract_ocr is False
+    with pytest.raises(ValidationError):
+        ConflictProcessingOptions(extract_ocr=True)
+
+    assert "禁止对附带图片或视频关键帧执行 OCR" in get_prompt_spec(
+        "report_refinement"
+    ).system_prompt
+    assert "禁止执行 OCR" in get_prompt_spec("attachment_enrichment").system_prompt
+    assert "禁止对图片或视频关键帧执行 OCR" in get_prompt_spec(
+        "conflict_analysis"
+    ).system_prompt
 
 
 def test_image_sanitizer_rejects_pixel_bomb_before_writing_derivatives(

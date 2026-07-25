@@ -24,7 +24,7 @@ from ..models import (
 )
 from ..schemas.reports import ReportCreate, ReportLocation
 from ..security import Actor
-from ..utils import as_utc, utcnow
+from ..utils import as_utc, canonical_json, sha256_text, utcnow
 from .attachments import serialize_attachment
 from .contacts import create_reporter_contact, serialize_contact_masked
 
@@ -195,10 +195,32 @@ async def bind_attachments(
     if not attachment_ids:
         report.attachment_count = 0
         return
+    attachments = await load_bindable_attachments(
+        session,
+        incident_id=report.incident_id,
+        uploader_device_id=report.reporter_device_id,
+        attachment_ids=attachment_ids,
+    )
+    for attachment in attachments:
+        attachment.report_id = report.id
+    report.attachment_count = len(attachments)
+
+
+async def load_bindable_attachments(
+    session: AsyncSession,
+    *,
+    incident_id: str,
+    uploader_device_id: str,
+    attachment_ids: list[str],
+    bound_report_id: str | None = None,
+) -> list[Attachment]:
+    if not attachment_ids:
+        return []
     attachments = list(
         (await session.scalars(select(Attachment).where(Attachment.id.in_(attachment_ids)))).all()
     )
-    if len(attachments) != len(attachment_ids):
+    attachments_by_id = {attachment.id: attachment for attachment in attachments}
+    if len(attachments_by_id) != len(attachment_ids):
         raise ApiError(
             422,
             "ATTACHMENT_NOT_READY",
@@ -206,9 +228,9 @@ async def bind_attachments(
         )
     for attachment in attachments:
         if (
-            attachment.incident_id != report.incident_id
-            or attachment.uploader_device_id != report.reporter_device_id
-            or attachment.report_id is not None
+            attachment.incident_id != incident_id
+            or attachment.uploader_device_id != uploader_device_id
+            or attachment.report_id not in {None, bound_report_id}
             or attachment.directed_answer_id is not None
             or attachment.metadata_status != "ready"
             or attachment.malware_scan_status not in {"clean", "fake_clean"}
@@ -218,8 +240,7 @@ async def bind_attachments(
                 "ATTACHMENT_NOT_READY",
                 "attachment is not ready or is owned by another device",
             )
-        attachment.report_id = report.id
-    report.attachment_count = len(attachments)
+    return [attachments_by_id[attachment_id] for attachment_id in attachment_ids]
 
 
 async def replace_attachments(
@@ -309,6 +330,10 @@ async def create_report(
         analysis_id=payload.ai_refinement_id,
         incident_id=incident.id,
         actor=actor,
+        category=payload.category,
+        content=payload.content_original,
+        location_text=payload.location.text,
+        attachment_ids=payload.attachment_ids,
     )
     priority, source = effective_priority(
         payload.category,
@@ -366,6 +391,14 @@ async def validate_report_refinement(
     analysis_id: str | None,
     incident_id: str,
     actor: Actor,
+    category: str,
+    content: str,
+    location_text: str,
+    attachment_ids: list[str],
+    report_id: str | None = None,
+    report_revision: int | None = None,
+    bound_report_id: str | None = None,
+    use_stored_report_context: bool = False,
 ) -> AiAnalysis | None:
     if analysis_id is None:
         return None
@@ -384,6 +417,87 @@ async def validate_report_refinement(
         )
     if actor.is_resident and analysis.created_by_id != actor.subject_id:
         raise ApiError(403, "AI_REFINEMENT_ACCESS_DENIED", "无权使用其他设备的 AI 建议")
+    context = analysis.context_package or analysis.input_snapshot
+    request_context_candidate = context.get("request_context")
+    is_legacy_text_refinement = (
+        analysis.prompt_version == "cm-report-refinement-v1.0.0"
+        and analysis.context_sha256 is None
+        and analysis.context_package is None
+        and not attachment_ids
+        and "attachments" not in context
+        and isinstance(request_context_candidate, dict)
+        and "report_id" not in request_context_candidate
+        and "report_revision" not in request_context_candidate
+    )
+    if not is_legacy_text_refinement and (
+        analysis.context_sha256 is None
+        or analysis.context_sha256 != sha256_text(canonical_json(context))
+    ):
+        raise ApiError(422, "AI_REFINEMENT_INVALID", "AI 上报整理上下文完整性校验失败")
+    attachments = await load_bindable_attachments(
+        session,
+        incident_id=incident_id,
+        uploader_device_id=actor.subject_id,
+        attachment_ids=attachment_ids,
+        bound_report_id=bound_report_id if bound_report_id is not None else report_id,
+    )
+    expected_attachments = sorted(
+        (
+            {
+                "attachment_id": attachment.id,
+                "media_type": attachment.media_type,
+                "sha256": attachment.sha256,
+                "storage_etag": attachment.etag,
+                "size_bytes": attachment.size_bytes,
+            }
+            for attachment in attachments
+        ),
+        key=lambda item: str(item["attachment_id"]),
+    )
+    context_attachments = context.get("attachments", [])
+    if not isinstance(context_attachments, list):
+        context_attachments = []
+    actual_attachments = sorted(
+        (
+            {
+                "attachment_id": item.get("attachment_id"),
+                "media_type": item.get("media_type"),
+                "sha256": item.get("sha256"),
+                "storage_etag": item.get("storage_etag"),
+                "size_bytes": item.get("size_bytes"),
+            }
+            for item in context_attachments
+            if isinstance(item, dict)
+        ),
+        key=lambda item: str(item["attachment_id"]),
+    )
+    report_context = context.get("report")
+    request_context = context.get("request_context")
+    if not isinstance(report_context, dict) or not isinstance(request_context, dict):
+        raise ApiError(422, "AI_REFINEMENT_INVALID", "AI 上报整理上下文结构无效")
+    context_report_id = request_context.get("report_id")
+    context_report_revision = request_context.get("report_revision")
+    if use_stored_report_context:
+        report_id = context_report_id if isinstance(context_report_id, str) else None
+        report_revision = (
+            context_report_revision if isinstance(context_report_revision, int) else None
+        )
+    refined_content = (
+        analysis.output.get("refined_content") if isinstance(analysis.output, dict) else None
+    )
+    if (
+        report_context.get("category") != category
+        or content not in {report_context.get("content"), refined_content}
+        or report_context.get("location_text") != location_text
+        or actual_attachments != expected_attachments
+        or context_report_id != report_id
+        or context_report_revision != report_revision
+    ):
+        raise ApiError(
+            422,
+            "AI_REFINEMENT_CONTEXT_MISMATCH",
+            "AI 上报整理结果与当前正文、位置或附件不一致，请重新分析",
+        )
     return analysis
 
 

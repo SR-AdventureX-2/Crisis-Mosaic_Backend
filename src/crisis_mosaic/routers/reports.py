@@ -488,7 +488,7 @@ async def patch_report(
                 report.is_urgent = payload.is_urgent
             if "ai_refinement_id" in fields:
                 report.ai_refinement_id = payload.ai_refinement_id
-            elif fields & {"category", "content_original", "location"}:
+            elif fields & {"category", "content_original", "location", "attachment_ids"}:
                 report.ai_refinement_id = None
             if "reporter" in fields:
                 if payload.reporter is None:
@@ -512,11 +512,33 @@ async def patch_report(
                     report=report,
                     attachment_ids=payload.attachment_ids,
                 )
+            final_attachment_ids = list(
+                (
+                    await session.scalars(
+                        select(Attachment.id)
+                        .where(Attachment.report_id == report.id)
+                        .order_by(Attachment.id)
+                    )
+                ).all()
+            )
+            reuse_stored_refinement_context = (
+                report.ai_refinement_id is not None
+                and "ai_refinement_id" not in fields
+                and not fields & {"category", "content_original", "location", "attachment_ids"}
+            )
             refinement = await validate_report_refinement(
                 session,
                 analysis_id=report.ai_refinement_id,
                 incident_id=incident.id,
                 actor=actor,
+                category=report.category,
+                content=report.content_original,
+                location_text=report.location_text,
+                attachment_ids=final_attachment_ids,
+                report_id=report.id,
+                report_revision=payload.revision,
+                bound_report_id=(report.id if reuse_stored_refinement_context else None),
+                use_stored_report_context=reuse_stored_refinement_context,
             )
             priority, source = effective_priority(
                 report.category,
@@ -870,11 +892,26 @@ async def patch_report_priority(
                 )
             before = report_snapshot(report)
             report.manual_priority = payload.priority
+            final_attachment_ids = list(
+                (
+                    await session.scalars(
+                        select(Attachment.id)
+                        .where(Attachment.report_id == report.id)
+                        .order_by(Attachment.id)
+                    )
+                ).all()
+            )
             refinement = await validate_report_refinement(
                 session,
                 analysis_id=report.ai_refinement_id,
                 incident_id=incident.id,
                 actor=actor,
+                category=report.category,
+                content=report.content_original,
+                location_text=report.location_text,
+                attachment_ids=final_attachment_ids,
+                bound_report_id=report.id,
+                use_stored_report_context=True,
             )
             priority, source = effective_priority(
                 report.category,

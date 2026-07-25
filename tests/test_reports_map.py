@@ -17,6 +17,7 @@ from crisis_mosaic.db import get_session
 from crisis_mosaic.dependencies import get_actor
 from crisis_mosaic.errors import ApiError, install_error_handlers
 from crisis_mosaic.models import (
+    AiAnalysis,
     AnonymousDevice,
     Attachment,
     AuditLog,
@@ -38,7 +39,7 @@ from crisis_mosaic.services.reports import (
     assert_report_access,
     create_report,
 )
-from crisis_mosaic.utils import utcnow
+from crisis_mosaic.utils import canonical_json, sha256_text, utcnow
 
 
 async def _database() -> tuple[Any, async_sessionmaker[Any]]:
@@ -100,6 +101,112 @@ def test_patch_uses_model_fields_set_to_distinguish_omitted_and_null() -> None:
 
     assert "ai_refinement_id" not in omitted.model_fields_set
     assert "ai_refinement_id" in explicit_null.model_fields_set
+
+
+def test_patch_reuses_bound_refinement_for_non_context_changes() -> None:
+    async def scenario() -> None:
+        engine, factory = await _database()
+        try:
+            async with factory() as session:
+                async with session.begin():
+                    incident, _, actor = await _seed(session)
+                    report = await create_report(
+                        session,
+                        incident=incident,
+                        actor=actor,
+                        payload=ReportCreate(
+                            category="road",
+                            reporter=_reporter(),
+                            content_original="Road is blocked",
+                            location={"text": "Daguan Bridge"},
+                        ),
+                    )
+                    context = {
+                        "request_context": {
+                            "incident_id": incident.id,
+                            "language": "zh-CN",
+                            "timezone": "Asia/Shanghai",
+                            "report_id": report.id,
+                            "report_revision": report.revision,
+                        },
+                        "report": {
+                            "category": report.category,
+                            "content": report.content_original,
+                            "location_text": report.location_text,
+                        },
+                        "attachments": [],
+                    }
+                    refinement = AiAnalysis(
+                        incident_id=incident.id,
+                        analysis_type="report_refinement",
+                        status="succeeded",
+                        input_snapshot=context,
+                        context_package=context,
+                        context_sha256=sha256_text(canonical_json(context)),
+                        output={
+                            "refined_content": (
+                                "【道路情况】Road is blocked\n【位置】Daguan Bridge"
+                            ),
+                            "suggest_urgent": False,
+                            "confidence": 0.8,
+                        },
+                        prompt_version="cm-report-refinement-v1.1.0",
+                        created_by_type="device",
+                        created_by_id=actor.subject_id,
+                    )
+                    session.add(refinement)
+                    await session.flush()
+                    report_id = report.id
+                    incident_id = incident.id
+                    refinement_id = refinement.id
+
+            async def session_override() -> AsyncIterator[Any]:
+                async with factory() as session:
+                    yield session
+
+            async def actor_override() -> Actor:
+                return actor
+
+            app = FastAPI()
+            install_error_handlers(app)
+            app.include_router(reports_router, prefix="/api/v1")
+            app.dependency_overrides[get_actor] = actor_override
+            app.dependency_overrides[get_session] = session_override
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                applied = await client.patch(
+                    f"/api/v1/reports/{report_id}",
+                    headers={"X-Incident-Id": incident_id},
+                    json={"revision": 1, "ai_refinement_id": refinement_id},
+                )
+                assert applied.status_code == 200, applied.text
+
+                urgent = await client.patch(
+                    f"/api/v1/reports/{report_id}",
+                    headers={"X-Incident-Id": incident_id},
+                    json={"revision": 2, "is_urgent": True},
+                )
+                assert urgent.status_code == 200, urgent.text
+                assert urgent.json()["data"]["ai_refinement_id"] == refinement_id
+
+                display = await client.patch(
+                    f"/api/v1/reports/{report_id}",
+                    headers={"X-Incident-Id": incident_id},
+                    json={"revision": 3, "content_display": "Road remains blocked"},
+                )
+                assert display.status_code == 200, display.text
+
+                explicit_rebind = await client.patch(
+                    f"/api/v1/reports/{report_id}",
+                    headers={"X-Incident-Id": incident_id},
+                    json={"revision": 4, "ai_refinement_id": refinement_id},
+                )
+                assert explicit_rebind.status_code == 422
+                assert explicit_rebind.json()["error"]["code"] == "AI_REFINEMENT_CONTEXT_MISMATCH"
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
 
 
 def test_report_responses_include_attachments_and_patch_replaces_explicitly() -> None:

@@ -230,7 +230,7 @@ async def conflict_analysis(
                     or str(item.get("type", item.get("kind", "text"))).lower()
                     not in {"image", "attachment", "photo"}
                 ),
-                "digest": "图片读取 → OCR/视觉提取 → 文字归一化 → 时间线对齐 → 多来源交叉验证",
+                "digest": "图片读取 → 非文字视觉提取 → 文字归一化 → 时间线对齐 → 多来源交叉验证",
                 "context_sha256": analysis.context_sha256,
             },
         }

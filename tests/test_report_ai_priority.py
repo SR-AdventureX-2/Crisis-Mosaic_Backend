@@ -5,10 +5,16 @@ import asyncio
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from crisis_mosaic.errors import ApiError
 from crisis_mosaic.models import AiAnalysis, AnonymousDevice, Base, Incident
 from crisis_mosaic.schemas.reports import ReportCreate
 from crisis_mosaic.security import Actor
-from crisis_mosaic.services.reports import ai_priority_from_refinement, create_report
+from crisis_mosaic.services.reports import (
+    ai_priority_from_refinement,
+    create_report,
+    validate_report_refinement,
+)
+from crisis_mosaic.utils import canonical_json, sha256_text
 
 
 def _analysis(*, suggest_urgent: bool, confidence: object = None) -> AiAnalysis:
@@ -85,18 +91,61 @@ def test_create_report_persists_high_priority_from_owned_ai_refinement() -> None
                         token_version=1,
                         incident_ids=frozenset({incident.id}),
                     )
+                    context = {
+                        "request_context": {
+                            "incident_id": incident.id,
+                            "language": "zh-CN",
+                            "timezone": "Asia/Shanghai",
+                        },
+                        "report": {
+                            "category": "road",
+                            "content": "Road is blocked",
+                            "location_text": "Daguan Bridge",
+                        },
+                    }
+                    refined_content = "【道路情况】Road is blocked\n【位置】Daguan Bridge"
                     refinement = AiAnalysis(
                         incident_id=incident.id,
                         analysis_type="report_refinement",
                         status="succeeded",
-                        input_snapshot={},
-                        output={"suggest_urgent": True, "confidence": 0.82},
+                        input_snapshot=context,
+                        context_package=context,
+                        context_sha256=sha256_text(canonical_json(context)),
+                        output={
+                            "refined_content": refined_content,
+                            "suggest_urgent": True,
+                            "confidence": 0.82,
+                        },
                         prompt_version="test-v1",
                         created_by_type="device",
                         created_by_id=device.id,
                     )
                     session.add(refinement)
                     await session.flush()
+
+                    validated_original = await validate_report_refinement(
+                        session,
+                        analysis_id=refinement.id,
+                        incident_id=incident.id,
+                        actor=actor,
+                        category="road",
+                        content="Road is blocked",
+                        location_text="Daguan Bridge",
+                        attachment_ids=[],
+                    )
+                    assert validated_original is refinement
+                    with pytest.raises(ApiError) as wrong_attachment:
+                        await validate_report_refinement(
+                            session,
+                            analysis_id=refinement.id,
+                            incident_id=incident.id,
+                            actor=actor,
+                            category="road",
+                            content="Road is blocked",
+                            location_text="Daguan Bridge",
+                            attachment_ids=["missing"],
+                        )
+                    assert wrong_attachment.value.code == "ATTACHMENT_NOT_READY"
 
                     report = await create_report(
                         session,
@@ -108,7 +157,7 @@ def test_create_report_persists_high_priority_from_owned_ai_refinement() -> None
                                 "full_name": "Zhang Ming",
                                 "mobile": "13800138000",
                             },
-                            content_original="Road is blocked",
+                            content_original=refined_content,
                             location={"text": "Daguan Bridge"},
                             ai_refinement_id=refinement.id,
                         ),
@@ -117,6 +166,186 @@ def test_create_report_persists_high_priority_from_owned_ai_refinement() -> None
                     assert report.priority == "high"
                     assert report.priority_source == "ai"
                     assert report.ai_refinement_id == refinement.id
+                    with pytest.raises(ApiError) as mismatch:
+                        await validate_report_refinement(
+                            session,
+                            analysis_id=refinement.id,
+                            incident_id=incident.id,
+                            actor=actor,
+                            category=report.category,
+                            content=report.content_original,
+                            location_text=report.location_text,
+                            attachment_ids=[],
+                            report_id=report.id,
+                            report_revision=report.revision,
+                            bound_report_id=report.id,
+                        )
+                    assert mismatch.value.code == "AI_REFINEMENT_CONTEXT_MISMATCH"
+
+                    edit_context = {
+                        **context,
+                        "request_context": {
+                            **context["request_context"],
+                            "report_id": report.id,
+                            "report_revision": report.revision,
+                        },
+                        "attachments": [],
+                    }
+                    edit_refinement = AiAnalysis(
+                        incident_id=incident.id,
+                        analysis_type="report_refinement",
+                        status="succeeded",
+                        input_snapshot=edit_context,
+                        context_package=edit_context,
+                        context_sha256=sha256_text(canonical_json(edit_context)),
+                        output={
+                            "refined_content": refined_content,
+                            "suggest_urgent": True,
+                            "confidence": 0.82,
+                        },
+                        prompt_version="test-v1",
+                        created_by_type="device",
+                        created_by_id=device.id,
+                    )
+                    session.add(edit_refinement)
+                    await session.flush()
+                    with pytest.raises(ApiError) as wrong_revision:
+                        await validate_report_refinement(
+                            session,
+                            analysis_id=edit_refinement.id,
+                            incident_id=incident.id,
+                            actor=actor,
+                            category=report.category,
+                            content=report.content_original,
+                            location_text=report.location_text,
+                            attachment_ids=[],
+                            report_id=report.id,
+                            report_revision=report.revision + 1,
+                            bound_report_id=report.id,
+                        )
+                    assert wrong_revision.value.code == "AI_REFINEMENT_CONTEXT_MISMATCH"
+
+                    reused_after_revision_advance = await validate_report_refinement(
+                        session,
+                        analysis_id=edit_refinement.id,
+                        incident_id=incident.id,
+                        actor=actor,
+                        category=report.category,
+                        content=report.content_original,
+                        location_text=report.location_text,
+                        attachment_ids=[],
+                        report_id=report.id,
+                        report_revision=report.revision + 1,
+                        bound_report_id=report.id,
+                        use_stored_report_context=True,
+                    )
+                    assert reused_after_revision_advance is edit_refinement
+
+                    legacy_refinement = AiAnalysis(
+                        incident_id=incident.id,
+                        analysis_type="report_refinement",
+                        status="succeeded",
+                        input_snapshot=context,
+                        context_package=None,
+                        context_sha256=None,
+                        output={
+                            "refined_content": refined_content,
+                            "suggest_urgent": False,
+                            "confidence": 0.8,
+                        },
+                        prompt_version="cm-report-refinement-v1.0.0",
+                        created_by_type="device",
+                        created_by_id=device.id,
+                    )
+                    session.add(legacy_refinement)
+                    await session.flush()
+
+                    validated_legacy = await validate_report_refinement(
+                        session,
+                        analysis_id=legacy_refinement.id,
+                        incident_id=incident.id,
+                        actor=actor,
+                        category="road",
+                        content="Road is blocked",
+                        location_text="Daguan Bridge",
+                        attachment_ids=[],
+                    )
+                    assert validated_legacy is legacy_refinement
+
+                    for category, content, location_text in (
+                        ("rescue", "Road is blocked", "Daguan Bridge"),
+                        ("road", "Road is passable", "Daguan Bridge"),
+                        ("road", "Road is blocked", "Another bridge"),
+                    ):
+                        with pytest.raises(ApiError) as legacy_context_mismatch:
+                            await validate_report_refinement(
+                                session,
+                                analysis_id=legacy_refinement.id,
+                                incident_id=incident.id,
+                                actor=actor,
+                                category=category,
+                                content=content,
+                                location_text=location_text,
+                                attachment_ids=[],
+                            )
+                        assert (
+                            legacy_context_mismatch.value.code == "AI_REFINEMENT_CONTEXT_MISMATCH"
+                        )
+
+                    other_actor = Actor(
+                        subject_type="device",
+                        subject_id="other-device",
+                        role="resident",
+                        token_version=1,
+                        incident_ids=frozenset({incident.id}),
+                    )
+                    with pytest.raises(ApiError) as legacy_wrong_owner:
+                        await validate_report_refinement(
+                            session,
+                            analysis_id=legacy_refinement.id,
+                            incident_id=incident.id,
+                            actor=other_actor,
+                            category="road",
+                            content="Road is blocked",
+                            location_text="Daguan Bridge",
+                            attachment_ids=[],
+                        )
+                    assert legacy_wrong_owner.value.code == "AI_REFINEMENT_ACCESS_DENIED"
+
+                    legacy_refinement.input_snapshot = {**context, "attachments": []}
+                    with pytest.raises(ApiError) as legacy_with_attachment_context:
+                        await validate_report_refinement(
+                            session,
+                            analysis_id=legacy_refinement.id,
+                            incident_id=incident.id,
+                            actor=actor,
+                            category="road",
+                            content="Road is blocked",
+                            location_text="Daguan Bridge",
+                            attachment_ids=[],
+                        )
+                    assert legacy_with_attachment_context.value.code == "AI_REFINEMENT_INVALID"
+
+                    legacy_refinement.input_snapshot = {
+                        **context,
+                        "request_context": {
+                            **context["request_context"],
+                            "report_id": report.id,
+                            "report_revision": report.revision,
+                        },
+                    }
+                    with pytest.raises(ApiError) as legacy_with_report_context:
+                        await validate_report_refinement(
+                            session,
+                            analysis_id=legacy_refinement.id,
+                            incident_id=incident.id,
+                            actor=actor,
+                            category="road",
+                            content="Road is blocked",
+                            location_text="Daguan Bridge",
+                            attachment_ids=[],
+                        )
+                    assert legacy_with_report_context.value.code == "AI_REFINEMENT_INVALID"
         finally:
             await engine.dispose()
 

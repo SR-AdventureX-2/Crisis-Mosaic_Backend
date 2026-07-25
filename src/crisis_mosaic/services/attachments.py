@@ -14,6 +14,8 @@ from ..models import Attachment
 from ..utils import isoformat, utcnow
 from .qiniu import sign_download_url
 
+_NO_TEXT_VISION_PREFIX = "[vision_policy:no_text_v1]\n"
+
 
 def _local_attachment_signature(
     attachment_id: str,
@@ -156,10 +158,15 @@ def serialize_attachment(attachment: Attachment) -> dict[str, Any]:
         "source_cluster_id": attachment.source_cluster_id,
         "metadata_status": attachment.metadata_status,
         "malware_scan_status": attachment.malware_scan_status,
-        "ocr_status": attachment.ocr_status,
+        "ocr_status": "not_applicable",
         "vision_status": attachment.vision_status,
-        "ocr_text": attachment.ocr_text,
-        "vision_summary": attachment.vision_summary,
+        "ocr_text": None,
+        "vision_summary": (
+            attachment.vision_summary.removeprefix(_NO_TEXT_VISION_PREFIX)
+            if attachment.vision_summary
+            and attachment.vision_summary.startswith(_NO_TEXT_VISION_PREFIX)
+            else None
+        ),
         "transcript_status": attachment.transcript_status,
         "transcode_status": attachment.transcode_status,
         "keyframe_status": attachment.keyframe_status,

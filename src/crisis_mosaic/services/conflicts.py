@@ -36,6 +36,8 @@ from ..services.map_features import (
 )
 from ..utils import as_utc, canonical_json, isoformat, sha256_text, utcnow
 
+_NO_TEXT_VISION_PREFIX = "[vision_policy:no_text_v1]\n"
+
 
 def fragment_snapshot(fragment: InformationFragment) -> dict[str, Any]:
     return {
@@ -120,8 +122,12 @@ async def evidence_snapshot(
             "mime_type": attachment.mime_type,
             "sha256": attachment.sha256,
             "perceptual_hash": attachment.perceptual_hash,
-            "ocr_text": attachment.ocr_text,
-            "vision_summary": attachment.vision_summary,
+            "vision_summary": (
+                attachment.vision_summary.removeprefix(_NO_TEXT_VISION_PREFIX)
+                if attachment.vision_summary
+                and attachment.vision_summary.startswith(_NO_TEXT_VISION_PREFIX)
+                else None
+            ),
             "malware_scan_status": attachment.malware_scan_status,
             "created_at": isoformat(attachment.created_at),
         }
