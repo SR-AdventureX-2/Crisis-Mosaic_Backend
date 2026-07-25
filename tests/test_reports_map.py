@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from datetime import timedelta
 from typing import Any
@@ -12,14 +13,17 @@ from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from crisis_mosaic.db import get_session
 from crisis_mosaic.dependencies import get_actor
 from crisis_mosaic.errors import ApiError, install_error_handlers
 from crisis_mosaic.models import (
     AnonymousDevice,
     Attachment,
+    AuditLog,
     Base,
     Incident,
     MapFeature,
+    OutboxEvent,
     Report,
     ReportRevision,
 )
@@ -215,6 +219,362 @@ def test_report_responses_include_attachments_and_patch_replaces_explicitly() ->
                 stored_report = await session.get(Report, report_id)
                 assert stored_report is not None
                 assert stored_report.attachment_count == 0
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_http_report_reads_return_plain_contact_without_caching() -> None:
+    async def scenario() -> None:
+        engine, factory = await _database()
+        try:
+            async with factory() as session:
+                async with session.begin():
+                    incident, _, resident = await _seed(session)
+                    report = await create_report(
+                        session,
+                        incident=incident,
+                        actor=resident,
+                        payload=ReportCreate(
+                            category="road",
+                            reporter={
+                                "full_name": "Zhang Ming",
+                                "mobile": "13800138000",
+                                "additional_info": {
+                                    "national_id": "11010519491231002X",
+                                    "emergency_contact": {
+                                        "name": "Li Ming",
+                                        "mobile": "13900139000",
+                                        "relation": "friend",
+                                    },
+                                    "rescue_notes": "Needs medication",
+                                },
+                            },
+                            content_original="Road is blocked",
+                            location={"text": "Daguan Bridge"},
+                        ),
+                    )
+                    report_id = report.id
+                    incident_id = incident.id
+
+            operator = Actor(
+                subject_type="account",
+                subject_id="operator-report-reader",
+                role="operator",
+                token_version=1,
+                incident_ids=frozenset({incident_id}),
+                username="operator",
+            )
+            admin = Actor(
+                subject_type="account",
+                subject_id="admin-report-reader",
+                role="admin",
+                token_version=1,
+                incident_ids=frozenset({incident_id}),
+                username="admin",
+            )
+            actor_ref = {"value": operator}
+
+            async def session_override() -> AsyncIterator[Any]:
+                async with factory() as session:
+                    yield session
+
+            async def actor_override() -> Actor:
+                return actor_ref["value"]
+
+            app = FastAPI()
+            install_error_handlers(app)
+            app.include_router(reports_router, prefix="/api/v1")
+            app.dependency_overrides[get_actor] = actor_override
+            app.dependency_overrides[get_session] = session_override
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            headers = {"X-Incident-Id": incident_id}
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                list_response = await client.get(
+                    f"/api/v1/incidents/{incident_id}/reports",
+                    headers=headers,
+                )
+                assert list_response.status_code == 200, list_response.text
+                listed = list_response.json()["data"][0]
+                assert listed["source"] == {
+                    "type": "anonymous_device",
+                    "device_id": resident.subject_id,
+                }
+                assert listed["reporter"] == {
+                    "full_name_masked": "Z***",
+                    "mobile_masked": "138****8000",
+                    "has_national_id": True,
+                    "emergency_contact": {
+                        "name_masked": "L***",
+                        "mobile_masked": "139****9000",
+                        "relation_masked": "friend",
+                    },
+                    "has_rescue_notes": True,
+                }
+                assert "Zhang Ming" not in list_response.text
+                assert "13800138000" not in list_response.text
+
+                detail_response = await client.get(
+                    f"/api/v1/reports/{report_id}",
+                    headers=headers,
+                )
+                assert detail_response.status_code == 200, detail_response.text
+                assert detail_response.headers["cache-control"] == "no-store"
+                plain_reporter = {
+                    "full_name": "Zhang Ming",
+                    "mobile": "+8613800138000",
+                    "additional_info": {
+                        "national_id": "11010519491231002X",
+                        "emergency_contact": {
+                            "name": "Li Ming",
+                            "mobile": "+8613900139000",
+                            "relation": "friend",
+                        },
+                        "rescue_notes": "Needs medication",
+                    },
+                }
+                assert detail_response.json()["data"]["reporter"] == plain_reporter
+
+                actor_ref["value"] = admin
+                admin_response = await client.get(
+                    f"/api/v1/reports/{report_id}",
+                    headers=headers,
+                )
+                assert admin_response.status_code == 200, admin_response.text
+                assert admin_response.headers["cache-control"] == "no-store"
+                assert admin_response.json()["data"]["reporter"] == plain_reporter
+
+                actor_ref["value"] = resident
+                resident_response = await client.get(
+                    f"/api/v1/reports/{report_id}",
+                    headers=headers,
+                )
+                assert resident_response.status_code == 200, resident_response.text
+                assert resident_response.headers["cache-control"] == "no-store"
+                assert resident_response.json()["data"]["reporter"] == {
+                    "full_name_masked": "Z***",
+                    "mobile_masked": "138****8000",
+                    "has_national_id": True,
+                    "emergency_contact": {
+                        "name_masked": "L***",
+                        "mobile_masked": "139****9000",
+                        "relation_masked": "friend",
+                    },
+                    "has_rescue_notes": True,
+                }
+
+            async with factory() as session:
+                audits = list(
+                    (
+                        await session.scalars(
+                            select(AuditLog)
+                            .where(
+                                AuditLog.resource_id == report_id,
+                                AuditLog.action == "report.command_detail_read",
+                            )
+                            .order_by(AuditLog.created_at)
+                        )
+                    ).all()
+                )
+                assert [audit.actor_id for audit in audits] == [
+                    operator.subject_id,
+                    admin.subject_id,
+                ]
+                assert [audit.details["metadata"]["actor_role"] for audit in audits] == [
+                    "operator",
+                    "admin",
+                ]
+                assert all(
+                    audit.details["metadata"]["access_scope"]
+                    == "authenticated_command_report_detail"
+                    for audit in audits
+                )
+                events = list(
+                    (
+                        await session.scalars(
+                            select(OutboxEvent).where(OutboxEvent.resource_id == report_id)
+                        )
+                    ).all()
+                )
+                assert events == []
+                persisted_security_records = json.dumps(
+                    {
+                        "audits": [audit.details for audit in audits],
+                        "events": [event.payload for event in events],
+                    },
+                    ensure_ascii=False,
+                )
+                assert "Zhang Ming" not in persisted_security_records
+                assert "13800138000" not in persisted_security_records
+                assert "11010519491231002X" not in persisted_security_records
+                assert "Needs medication" not in persisted_security_records
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_resident_owner_can_soft_delete_report_with_revision() -> None:
+    async def scenario() -> None:
+        engine, factory = await _database()
+        try:
+            async with factory() as session:
+                async with session.begin():
+                    incident, _, owner = await _seed(session)
+                    report = await create_report(
+                        session,
+                        incident=incident,
+                        actor=owner,
+                        payload=ReportCreate(
+                            category="road",
+                            reporter={
+                                "full_name": "Delete Owner",
+                                "mobile": "13800138000",
+                            },
+                            content_original="Delete this report",
+                            location={
+                                "text": "Daguan Bridge",
+                                "latitude": 30.31,
+                                "longitude": 120.15,
+                                "coordinate_system": "gcj02",
+                            },
+                        ),
+                    )
+                    report_id = report.id
+                    incident_id = incident.id
+
+            operator = Actor(
+                subject_type="account",
+                subject_id="operator-delete-denied",
+                role="operator",
+                token_version=1,
+                incident_ids=frozenset({incident_id}),
+                username="operator",
+            )
+            other_resident = Actor(
+                subject_type="device",
+                subject_id="other-resident-device",
+                role="resident",
+                token_version=1,
+                incident_ids=frozenset({incident_id}),
+            )
+            actor_ref = {"value": operator}
+
+            async def session_override() -> AsyncIterator[Any]:
+                async with factory() as session:
+                    yield session
+
+            async def actor_override() -> Actor:
+                return actor_ref["value"]
+
+            app = FastAPI()
+            install_error_handlers(app)
+            app.include_router(reports_router, prefix="/api/v1")
+            app.dependency_overrides[get_actor] = actor_override
+            app.dependency_overrides[get_session] = session_override
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            headers = {"X-Incident-Id": incident_id}
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                denied_operator = await client.request(
+                    "DELETE",
+                    f"/api/v1/reports/{report_id}",
+                    headers=headers,
+                    json={"revision": 1},
+                )
+                assert denied_operator.status_code == 403, denied_operator.text
+                assert denied_operator.json()["error"]["code"] == "RESIDENT_REQUIRED"
+
+                actor_ref["value"] = other_resident
+                denied_other = await client.request(
+                    "DELETE",
+                    f"/api/v1/reports/{report_id}",
+                    headers=headers,
+                    json={"revision": 1},
+                )
+                assert denied_other.status_code == 403, denied_other.text
+                assert denied_other.json()["error"]["code"] == "REPORT_OWNERSHIP_REQUIRED"
+
+                actor_ref["value"] = owner
+                stale = await client.request(
+                    "DELETE",
+                    f"/api/v1/reports/{report_id}",
+                    headers=headers,
+                    json={"revision": 2},
+                )
+                assert stale.status_code == 409, stale.text
+                assert stale.json()["error"]["code"] == "REVISION_CONFLICT"
+
+                deleted = await client.request(
+                    "DELETE",
+                    f"/api/v1/reports/{report_id}",
+                    headers=headers,
+                    json={"revision": 1},
+                )
+                assert deleted.status_code == 200, deleted.text
+                tombstone = deleted.json()["data"]
+                assert tombstone["report_id"] == report_id
+                assert tombstone["revision"] == 2
+                assert tombstone["deleted_at"] is not None
+
+                missing = await client.get(
+                    f"/api/v1/reports/{report_id}",
+                    headers=headers,
+                )
+                assert missing.status_code == 404, missing.text
+                reports_after_delete = await client.get(
+                    f"/api/v1/incidents/{incident_id}/reports",
+                    headers=headers,
+                )
+                assert reports_after_delete.status_code == 200, reports_after_delete.text
+                assert reports_after_delete.json()["data"] == []
+
+            async with factory() as session:
+                stored_report = await session.get(Report, report_id)
+                assert stored_report is not None
+                assert stored_report.deleted_at is not None
+                assert stored_report.revision == 2
+                revisions = list(
+                    (
+                        await session.scalars(
+                            select(ReportRevision)
+                            .where(ReportRevision.report_id == report_id)
+                            .order_by(ReportRevision.revision)
+                        )
+                    ).all()
+                )
+                assert [revision.revision for revision in revisions] == [1, 2]
+                assert revisions[-1].change_reason == "resident_deleted"
+                assert revisions[-1].snapshot["deleted_at"] == tombstone["deleted_at"]
+
+                feature = await session.scalar(
+                    select(MapFeature).where(MapFeature.source_ref == report_id)
+                )
+                assert feature is not None
+                assert feature.is_deleted is True
+                audit = await session.scalar(
+                    select(AuditLog).where(
+                        AuditLog.resource_id == report_id,
+                        AuditLog.action == "report.deleted",
+                    )
+                )
+                assert audit is not None
+                event = await session.scalar(
+                    select(OutboxEvent).where(
+                        OutboxEvent.resource_id == report_id,
+                        OutboxEvent.event_type == "report.deleted",
+                    )
+                )
+                assert event is not None
+                assert event.visibility == "owner"
+                assert event.owner_device_id == owner.subject_id
+                assert event.payload["data"] == tombstone
+                persisted_payloads = json.dumps(
+                    {"audit": audit.details, "event": event.payload},
+                    ensure_ascii=False,
+                )
+                assert "Delete Owner" not in persisted_payloads
+                assert "13800138000" not in persisted_payloads
         finally:
             await engine.dispose()
 

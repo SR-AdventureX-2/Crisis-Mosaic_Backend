@@ -388,10 +388,16 @@ async def validate_report_refinement(
 
 
 def ai_priority_from_refinement(analysis: AiAnalysis | None) -> Priority | None:
+    if analysis is None or analysis.output is None:
+        return None
+    if analysis.output.get("suggest_urgent") is not True:
+        return None
+
+    confidence = analysis.output.get("confidence")
     if (
-        analysis is not None
-        and analysis.output is not None
-        and analysis.output.get("suggest_urgent") is True
+        isinstance(confidence, (int, float))
+        and not isinstance(confidence, bool)
+        and confidence >= 0.70
     ):
         return "high"
     return None

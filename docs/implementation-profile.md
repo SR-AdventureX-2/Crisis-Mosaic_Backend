@@ -28,7 +28,10 @@
 - 匿名会话和轮换 Token 固定绑定当前 `active` 事件；事件停用后不可新签发或轮换。
 - 创建版本 1 同样写入上报历史。所有更新以 `revision` 做乐观并发控制。
 - 上报创建必须包含 reporter 联系方式；姓名、手机号、身份证、紧急联系人和救援备注
-  字段级加密，普通响应只返回脱敏形式。明文 reveal 只允许 admin + mock MFA，并写审计。
+  字段级加密。列表及居民详情始终只返回脱敏形式；仅已登录且通过事件访问校验的
+  operator/admin 在 `GET /api/v1/reports/{report_id}` 指挥详情中直接获得明文联系人和附加
+  信息。该响应强制 `Cache-Control: no-store`，每次明文详情读取写入不含 PII 的审计记录，
+  且不写入 Outbox。独立明文 reveal 仍只允许 admin + mock MFA，并写审计。
 - PATCH 省略字段表示保留；显式 `null` 仅清除允许为空的字段；位置对象整体替换。
 - 紧急上报固定为 `high/urgent_flag`；其余按人工覆盖、有效 AI 建议、类别默认值排序。
 - 定向回答只更新回答和信息碎片，不额外生成上报；PUT 可用 `attachment_ids` 替换绑定的

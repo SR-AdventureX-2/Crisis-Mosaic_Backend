@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 from fastapi import APIRouter, Request, Response, status
 from fastapi.responses import FileResponse, RedirectResponse
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
 from ..db import write_lock
@@ -22,7 +23,11 @@ from ..schemas.uploads import (
     ResumableSessionRequest,
     UploadCompleteRequest,
 )
-from ..services.attachments import attachment_state, serialize_attachment
+from ..services.attachments import (
+    attachment_state,
+    serialize_attachment,
+    verify_local_attachment_url,
+)
 from ..services.events import emit_event, record_audit
 from ..services.qiniu import sign_download_url, verify_callback_authorization
 from ..services.uploads import (
@@ -571,6 +576,96 @@ async def download_thumbnail(
     return FileResponse(path, media_type="image/jpeg")
 
 
+async def _get_signed_local_attachment(
+    *,
+    attachment_id: str,
+    resource: str,
+    expires_at: str,
+    signature: str,
+    session: AsyncSession,
+) -> Attachment:
+    if not verify_local_attachment_url(
+        attachment_id,
+        resource,
+        expires_at,
+        signature,
+    ):
+        raise ApiError(
+            403,
+            "SIGNED_ATTACHMENT_URL_INVALID",
+            "Attachment URL is invalid or expired",
+        )
+    attachment = await session.get(Attachment, attachment_id)
+    if attachment is None:
+        raise ApiError(404, "ATTACHMENT_NOT_FOUND", "Attachment does not exist")
+    if attachment.storage_provider != "local_proxy":
+        raise ApiError(
+            409,
+            "ATTACHMENT_NOT_LOCAL_PROXY",
+            "Attachment is not stored by the local proxy",
+        )
+    if attachment_state(attachment) != "ready":
+        raise ApiError(409, "ATTACHMENT_NOT_READY", "Attachment is not ready")
+    return attachment
+
+
+@router.get(
+    "/signed/{expires_at}/{signature}/{attachment_id}/content",
+    response_model=None,
+    include_in_schema=False,
+)
+async def download_signed_content(
+    attachment_id: str,
+    expires_at: str,
+    signature: str,
+    session: SessionDep,
+) -> FileResponse:
+    attachment = await _get_signed_local_attachment(
+        attachment_id=attachment_id,
+        resource="content",
+        expires_at=expires_at,
+        signature=signature,
+        session=session,
+    )
+    if not attachment.original_path:
+        raise ApiError(409, "ATTACHMENT_NOT_READY", "Attachment is not ready")
+    path = Path(attachment.original_path)
+    if not await asyncio.to_thread(path.is_file):
+        raise ApiError(404, "ATTACHMENT_CONTENT_MISSING", "Attachment file does not exist")
+    return FileResponse(
+        path,
+        media_type=attachment.mime_type or "application/octet-stream",
+        filename=attachment.file_name,
+        content_disposition_type="inline",
+    )
+
+
+@router.get(
+    "/signed/{expires_at}/{signature}/{attachment_id}/thumbnail",
+    response_class=FileResponse,
+    include_in_schema=False,
+)
+async def download_signed_thumbnail(
+    attachment_id: str,
+    expires_at: str,
+    signature: str,
+    session: SessionDep,
+) -> FileResponse:
+    attachment = await _get_signed_local_attachment(
+        attachment_id=attachment_id,
+        resource="thumbnail",
+        expires_at=expires_at,
+        signature=signature,
+        session=session,
+    )
+    if not attachment.thumbnail_path:
+        raise ApiError(409, "ATTACHMENT_NOT_READY", "Attachment thumbnail is not ready")
+    path = Path(attachment.thumbnail_path)
+    if not await asyncio.to_thread(path.is_file):
+        raise ApiError(404, "ATTACHMENT_CONTENT_MISSING", "Attachment file does not exist")
+    return FileResponse(path, media_type="image/jpeg")
+
+
 @callback_router.post("/qiniu/callback", status_code=status.HTTP_200_OK)
 async def qiniu_upload_callback(request: Request, session: SessionDep) -> dict[str, Any]:
     """七牛云上传回调：验签后标记附件上传完成并排队处理。"""
@@ -598,9 +693,7 @@ async def qiniu_upload_callback(request: Request, session: SessionDep) -> dict[s
     etag = etag_values[0] if etag_values else None
     fsize_values = form.get("fsize") or []
     fsize = int(fsize_values[0]) if fsize_values and fsize_values[0].isdigit() else None
-    attachment = await session.scalar(
-        select(Attachment).where(Attachment.object_key == object_key)
-    )
+    attachment = await session.scalar(select(Attachment).where(Attachment.object_key == object_key))
     if attachment is None:
         raise ApiError(404, "ATTACHMENT_NOT_FOUND", "附件不存在")
     if attachment.uploaded_at is not None:

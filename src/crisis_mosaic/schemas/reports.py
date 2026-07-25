@@ -143,6 +143,12 @@ class ReportPatch(BaseModel):
         return value
 
 
+class ReportDelete(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revision: Annotated[int, Field(ge=1)]
+
+
 class ReportStatusPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

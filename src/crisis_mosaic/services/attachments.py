@@ -1,15 +1,79 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 from collections.abc import Sequence
+from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..config import get_settings
+from ..config import Settings, get_settings
 from ..models import Attachment
-from ..utils import isoformat
+from ..utils import isoformat, utcnow
 from .qiniu import sign_download_url
+
+
+def _local_attachment_signature(
+    attachment_id: str,
+    resource: str,
+    expires_at: str,
+    settings: Settings,
+) -> str:
+    payload = f"local-proxy:v1:{attachment_id}:{resource}:{expires_at}".encode()
+    return hmac.new(
+        settings.upload_signing_secret.encode(),
+        payload,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def sign_local_attachment_url(
+    attachment_id: str,
+    resource: str,
+    *,
+    settings: Settings | None = None,
+    expires_at: int | None = None,
+) -> str:
+    if resource not in {"content", "thumbnail"}:
+        raise ValueError("unsupported local attachment resource")
+    settings = settings or get_settings()
+    deadline = expires_at
+    if deadline is None:
+        deadline = int((utcnow() + timedelta(minutes=settings.signed_download_minutes)).timestamp())
+    deadline_text = str(deadline)
+    signature = _local_attachment_signature(
+        attachment_id,
+        resource,
+        deadline_text,
+        settings,
+    )
+    prefix = settings.api_prefix.rstrip("/")
+    return f"{prefix}/uploads/signed/{deadline_text}/{signature}/{attachment_id}/{resource}"
+
+
+def verify_local_attachment_url(
+    attachment_id: str,
+    resource: str,
+    expires_at: str,
+    signature: str,
+    *,
+    settings: Settings | None = None,
+) -> bool:
+    settings = settings or get_settings()
+    valid_deadline = expires_at.isascii() and expires_at.isdecimal() and len(expires_at) <= 12
+    signing_deadline = expires_at if valid_deadline else "0"
+    expected = _local_attachment_signature(
+        attachment_id,
+        resource,
+        signing_deadline,
+        settings,
+    )
+    signature_matches = hmac.compare_digest(signature.encode(), expected.encode())
+    if not valid_deadline:
+        return False
+    return signature_matches and int(expires_at) > int(utcnow().timestamp())
 
 
 def attachment_state(attachment: Attachment) -> str:
@@ -30,8 +94,16 @@ def serialize_attachment(attachment: Attachment) -> dict[str, Any]:
     settings = get_settings()
     state = attachment_state(attachment)
     if attachment.storage_provider == "local_proxy":
-        content_url = f"/api/v1/uploads/{attachment.id}/content" if state == "ready" else None
-        thumbnail_url = f"/api/v1/uploads/{attachment.id}/thumbnail" if state == "ready" else None
+        content_url = (
+            sign_local_attachment_url(attachment.id, "content", settings=settings)
+            if state == "ready"
+            else None
+        )
+        thumbnail_url = (
+            sign_local_attachment_url(attachment.id, "thumbnail", settings=settings)
+            if state == "ready"
+            else None
+        )
     elif attachment.storage_provider == "qiniu_kodo":
         content_url = None
         thumbnail_url = None

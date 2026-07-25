@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Any
@@ -13,11 +13,12 @@ from ..db import write_lock
 from ..dependencies import ActorDep, IncidentHeader, SessionDep
 from ..domain.priority import effective_priority
 from ..errors import ApiError
-from ..models import Incident, Report, ReporterContact, ReportRevision
+from ..models import Attachment, Incident, Report, ReporterContact, ReportRevision
 from ..responses import success
 from ..schemas.reports import (
     ReportCategory,
     ReportCreate,
+    ReportDelete,
     ReporterRevealRequest,
     ReportPatch,
     ReportPriority,
@@ -25,6 +26,7 @@ from ..schemas.reports import (
     ReportStatus,
     ReportStatusPatch,
 )
+from ..security import Actor
 from ..services.attachments import attachments_by_report
 from ..services.contacts import (
     authorize_reveal,
@@ -51,7 +53,7 @@ from ..services.reports import (
     upsert_report_map_feature,
     validate_report_refinement,
 )
-from ..utils import as_utc, utcnow
+from ..utils import as_utc, isoformat, utcnow
 
 router = APIRouter(tags=["Reports"])
 
@@ -112,6 +114,19 @@ async def _contacts_for_reports(
         (await session.scalars(select(ReporterContact).where(ReporterContact.id.in_(ids)))).all()
     )
     return {row.id: row for row in rows}
+
+
+def _serialize_report_detail(
+    report: Report,
+    actor: Actor,
+    *,
+    contact: ReporterContact | None,
+    attachments: Sequence[Attachment],
+) -> dict[str, Any]:
+    data = serialize_report(report, actor, contact=contact, attachments=attachments)
+    if contact is not None and actor.role in {"operator", "admin"}:
+        data["reporter"] = serialize_contact_plain(contact)
+    return data
 
 
 def _priority_rank() -> Any:
@@ -333,6 +348,7 @@ async def list_reports(
 async def read_report(
     report_id: str,
     request: Request,
+    response: Response,
     session: SessionDep,
     actor: ActorDep,
     incident_header: IncidentHeader,
@@ -343,10 +359,35 @@ async def read_report(
     assert_incident_access(actor, incident, incident_header)
     contact = await _contact_for_report(session, report)
     attachments = (await attachments_by_report(session, [report.id])).get(report.id, [])
-    return success(
-        serialize_report(report, actor, contact=contact, attachments=attachments),
-        request,
+    data = _serialize_report_detail(
+        report,
+        actor,
+        contact=contact,
+        attachments=attachments,
     )
+    if contact is not None and actor.role in {"operator", "admin"}:
+        async with write_lock:
+            try:
+                await record_audit(
+                    session,
+                    actor=actor,
+                    incident_id=incident.id,
+                    action="report.command_detail_read",
+                    resource_type="report",
+                    resource_id=report.id,
+                    request_id=_request_id(request),
+                    metadata={
+                        "access_scope": "authenticated_command_report_detail",
+                        "actor_role": actor.role,
+                        "plaintext_reporter_fields_returned": True,
+                    },
+                )
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+    response.headers["Cache-Control"] = "no-store"
+    return success(data, request)
 
 
 @router.get("/reports/{report_id}/history")
@@ -531,6 +572,78 @@ async def patch_report(
                 serialize_report(report, actor, contact=contact, attachments=attachments),
                 request,
             )
+
+
+@router.delete("/reports/{report_id}")
+async def delete_report(
+    report_id: str,
+    payload: ReportDelete,
+    request: Request,
+    session: SessionDep,
+    actor: ActorDep,
+    incident_header: IncidentHeader,
+) -> dict[str, Any]:
+    if not actor.is_resident:
+        raise ApiError(403, "RESIDENT_REQUIRED", "only residents may delete their own reports")
+    async with write_lock:
+        async with _write_transaction(session):
+            report = await get_report(session, report_id)
+            assert_report_access(actor, report, write=True)
+            if report.is_directed_answer:
+                raise ApiError(404, "NOT_FOUND", "report not found")
+            incident = await _incident_for_report(session, report)
+            assert_incident_access(actor, incident, incident_header)
+            if report.revision != payload.revision:
+                _raise_revision_conflict(report, payload.revision)
+
+            before = report_snapshot(report)
+            deleted_at = utcnow()
+            report.deleted_at = deleted_at
+            report.revision += 1
+            report.updated_at = deleted_at
+            tombstone = {
+                "report_id": report.id,
+                "revision": report.revision,
+                "deleted_at": isoformat(deleted_at),
+            }
+            snapshot = {
+                **report_snapshot(report),
+                "deleted_at": tombstone["deleted_at"],
+            }
+            session.add(
+                ReportRevision(
+                    report_id=report.id,
+                    revision=report.revision,
+                    snapshot=snapshot,
+                    changed_by_type=actor.subject_type,
+                    changed_by_id=actor.subject_id,
+                    change_reason="resident_deleted",
+                )
+            )
+            await upsert_report_map_feature(session, report)
+            await record_audit(
+                session,
+                actor=actor,
+                incident_id=incident.id,
+                action="report.deleted",
+                resource_type="report",
+                resource_id=report.id,
+                request_id=_request_id(request),
+                before=before,
+                after=tombstone,
+            )
+            await emit_event(
+                session,
+                incident=incident,
+                event_type="report.deleted",
+                resource_type="report",
+                resource_id=report.id,
+                resource_revision=report.revision,
+                visibility="owner",
+                owner_device_id=report.reporter_device_id,
+                payload=tombstone,
+            )
+            return success(tombstone, request)
 
 
 @router.get("/me/reports/recent")
