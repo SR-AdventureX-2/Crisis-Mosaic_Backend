@@ -476,9 +476,6 @@ async def patch_report(
                 analysis_id=report.ai_refinement_id,
                 incident_id=incident.id,
                 actor=actor,
-                category=report.category,
-                content=report.content_original,
-                location_text=report.location_text,
             )
             priority, source = effective_priority(
                 report.category,
@@ -765,9 +762,6 @@ async def patch_report_priority(
                 analysis_id=report.ai_refinement_id,
                 incident_id=incident.id,
                 actor=actor,
-                category=report.category,
-                content=report.content_original,
-                location_text=report.location_text,
             )
             priority, source = effective_priority(
                 report.category,

@@ -119,6 +119,9 @@ class Settings(BaseSettings):
     ai_report_timeout_seconds: float = 5.0
     ai_conflict_timeout_seconds: float = 10.0
     ai_brief_timeout_seconds: float = 15.0
+    # 开启后：打印 AI 调用全链路详细日志（模型请求体/模型回复/返回客户端内容），
+    # 并静默其他所有日志（http_request、uvicorn 访问日志等）。仅限调试使用。
+    ai_debug_log: bool = False
     enable_legacy_demo_ai: bool = False
 
     max_image_bytes: int = 10 * 1024 * 1024

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -39,15 +40,31 @@ from .runtime_guard import SingleProcessGuard
 from .workers import start_workers, stop_workers
 
 
-def _configure_logging() -> None:
-    structlog.configure(
-        processors=[
-            structlog.contextvars.merge_contextvars,
-            structlog.processors.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso", utc=True),
-            structlog.processors.JSONRenderer(),
-        ]
-    )
+def _drop_non_ai_debug_events(
+    _logger: Any, _method_name: str, event_dict: dict[str, Any]
+) -> dict[str, Any]:
+    # AI 调试模式：仅保留 ai_debug.* 事件，静默 http_request 等其余 structlog 输出。
+    if not str(event_dict.get("event", "")).startswith("ai_debug"):
+        raise structlog.DropEvent
+    return event_dict
+
+
+def _configure_logging(settings: Any = None) -> None:
+    ai_debug_enabled = bool(getattr(settings, "ai_debug_log", False))
+    processors: list[Any] = [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+    ]
+    if ai_debug_enabled:
+        processors.insert(0, _drop_non_ai_debug_events)
+        # ensure_ascii=False 让中文提示词/回复以原文输出，便于人工核对。
+        processors.append(structlog.processors.JSONRenderer(ensure_ascii=False, indent=2))
+        for logger_name in ("uvicorn.access", "uvicorn.error", "uvicorn"):
+            logging.getLogger(logger_name).setLevel(logging.WARNING)
+    else:
+        processors.append(structlog.processors.JSONRenderer())
+    structlog.configure(processors=processors)
 
 
 @asynccontextmanager
@@ -77,7 +94,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    _configure_logging()
+    _configure_logging(settings)
     app = FastAPI(
         title=settings.app_name,
         version="0.1.0",

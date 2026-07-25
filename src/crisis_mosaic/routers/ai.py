@@ -22,6 +22,7 @@ from ..schemas.ai import (
     ReportRefinementResponse,
 )
 from ..services.ai import (
+    ai_debug,
     analyze_legacy_conflict,
     enqueue_command_brief,
     enqueue_conflict_analysis,
@@ -127,7 +128,7 @@ async def report_refinement(
     if not await session.get(Incident, payload.incident_id):
         raise ApiError(404, "INCIDENT_NOT_FOUND", "事件不存在")
     analysis, output = await refine_report(session, payload, actor)
-    return success(
+    envelope = success(
         {
             "analysis_id": analysis.id,
             **output.model_dump(mode="json"),
@@ -135,6 +136,8 @@ async def report_refinement(
         },
         request,
     )
+    ai_debug("ai_debug.client_response", operation="report_refinement", response=envelope)
+    return envelope
 
 
 @router.post(
@@ -234,7 +237,14 @@ async def conflict_analysis(
         # Override the decorator's default status for the synchronous Flutter contract.
         from fastapi.responses import JSONResponse
 
-        return JSONResponse(status_code=200, content=success(result, request))
+        legacy_envelope = success(result, request)
+        ai_debug(
+            "ai_debug.client_response",
+            operation="conflict_analysis_legacy",
+            status_code=200,
+            response=legacy_envelope,
+        )
+        return JSONResponse(status_code=200, content=legacy_envelope)
     async with write_lock:
         await session.refresh(conflict)
         analysis = await enqueue_conflict_analysis(
@@ -277,7 +287,7 @@ async def conflict_analysis(
             payload={"analysis_id": analysis.id, "status": analysis.status},
         )
         await session.commit()
-    return success(
+    envelope = success(
         {
             "analysis_id": analysis.id,
             "status": analysis.status,
@@ -285,6 +295,8 @@ async def conflict_analysis(
         },
         request,
     )
+    ai_debug("ai_debug.client_response", operation="conflict_analysis", response=envelope)
+    return envelope
 
 
 @router.post(
@@ -322,7 +334,7 @@ async def command_brief(
             after={"status": analysis.status, "input_version": analysis.input_version},
         )
         await session.commit()
-    return success(
+    envelope = success(
         {
             "analysis_id": analysis.id,
             "status": analysis.status,
@@ -330,6 +342,8 @@ async def command_brief(
         },
         request,
     )
+    ai_debug("ai_debug.client_response", operation="command_brief", response=envelope)
+    return envelope
 
 
 @router.get(
@@ -357,7 +371,9 @@ async def analysis_status(
     if actor.role == "resident" and analysis.created_by_id != actor.subject_id:
         raise ApiError(403, "ANALYSIS_ACCESS_DENIED", "无权访问该 AI 分析")
     data = await _analysis_snapshot(session, analysis)
-    return success(data, request)
+    envelope = success(data, request)
+    ai_debug("ai_debug.client_response", operation="analysis_status", response=envelope)
+    return envelope
 
 
 async def _consume_ws_client_messages(websocket: WebSocket) -> None:
@@ -434,6 +450,12 @@ async def analysis_status_stream(websocket: WebSocket, analysis_id: str) -> None
                 return
             if data != last_sent:
                 await websocket.send_json({"type": "analysis_status", "data": data})
+                ai_debug(
+                    "ai_debug.client_response",
+                    operation="analysis_status_stream",
+                    analysis_id=analysis_id,
+                    message={"type": "analysis_status", "data": data},
+                )
                 last_sent = data
             if data["status"] in {"succeeded", "failed"}:
                 await websocket.close(code=1000, reason="analysis finished")
@@ -479,7 +501,7 @@ async def analysis_retry(
             after={"status": "queued"},
         )
         await session.commit()
-    return success(
+    envelope = success(
         {
             "analysis_id": analysis.id,
             "status": "queued",
@@ -487,3 +509,5 @@ async def analysis_retry(
         },
         request,
     )
+    ai_debug("ai_debug.client_response", operation="analysis_retry", response=envelope)
+    return envelope

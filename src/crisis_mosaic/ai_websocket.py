@@ -9,6 +9,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
+from starlette.websockets import WebSocketState
 
 from .config import get_settings
 from .db import session_factory
@@ -38,6 +39,7 @@ from .routers.ai import (
 )
 from .schemas.ai import CommandBriefRequest, ConflictAnalysisRequest, ReportRefinementRequest
 from .security import Actor
+from .services.ai import ai_debug
 from .utils import current_request_id, new_id, request_hash, utcnow
 
 router = APIRouter(tags=["AI"])
@@ -101,6 +103,16 @@ async def _send_error(
     }
     if operation is not None:
         frame["operation"] = operation
+    if (
+        websocket.client_state != WebSocketState.CONNECTED
+        or websocket.application_state != WebSocketState.CONNECTED
+    ):
+        logger.debug(
+            "AI WebSocket error frame skipped because the connection is closed",
+            extra={"request_id": server_request_id, "code": code},
+        )
+        return
+    ai_debug("ai_debug.client_response", channel="ai_ws", frame=frame)
     await websocket.send_json(frame)
 
 
@@ -255,6 +267,13 @@ async def _handle_request(
     incident_id: str,
 ) -> None:
     client_request_id = message.get("request_id") if isinstance(message, dict) else None
+    ai_debug(
+        "ai_debug.client_request",
+        channel="ai_ws",
+        actor_role=actor.role,
+        incident_id=incident_id,
+        frame=message,
+    )
     if not isinstance(client_request_id, str) or not 1 <= len(client_request_id) <= 200:
         await _send_error(
             websocket,
@@ -340,6 +359,23 @@ async def _handle_request(
                 "body": body,
             }
         )
+        ai_debug(
+            "ai_debug.client_response",
+            channel="ai_ws",
+            frame={
+                "type": "ai.response",
+                "request_id": client_request_id,
+                "operation": operation,
+                "status_code": status_code,
+                "body": body,
+            },
+        )
+    except WebSocketDisconnect:
+        logger.info(
+            "AI WebSocket client disconnected before response delivery",
+            extra={"request_id": server_request_id, "operation": operation},
+        )
+        raise
     except ValidationError as exc:
         await _send_error(
             websocket,

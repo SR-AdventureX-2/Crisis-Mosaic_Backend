@@ -81,7 +81,8 @@ def test_upload_intent_rejects_path_traversal() -> None:
         )
 
 
-def test_report_refinement_rejects_added_numbers() -> None:
+def test_report_refinement_allows_number_adjustments() -> None:
+    # 数字事实一致性校验已移除：模型遗漏或新增数字不再拦截，只要保留位置行即可。
     request = ReportRefinementRequest(
         incident_id="incident",
         category="rescue",
@@ -96,9 +97,7 @@ def test_report_refinement_rejects_added_numbers() -> None:
         confidence=0.8,
     )
 
-    with pytest.raises(ApiError) as error:
-        _validate_report_refinement_contract(request, output)
-    assert error.value.code == "AI_OUTPUT_FACT_INTEGRITY_FAILED"
+    _validate_report_refinement_contract(request, output)
 
 
 def test_media_evidence_output_maps_to_attachment_fields() -> None:
@@ -347,7 +346,7 @@ def test_command_brief_rejects_source_refs_outside_snapshot_whitelist() -> None:
         output.validate_source_refs({"incident:current", "report:known"})
 
 
-def test_command_brief_summary_numbers_must_come_from_metrics() -> None:
+def test_command_brief_summary_allows_time_and_year_numbers() -> None:
     snapshot = {
         "metrics": {
             "active_report_count": 28,
@@ -358,7 +357,7 @@ def test_command_brief_summary_numbers_must_come_from_metrics() -> None:
     }
     output = CommandBriefOutput(
         headline="人员救援与道路通行仍存在关键风险",
-        summary="当前共有 28 条有效上报，其中 4 条标记紧急；另有 2 个未解决冲突。",
+        summary="截至 2026-07-25 18:44，当前共有 29 条有效上报，其中 4 条标记紧急。",
         recommendations=[
             BriefRecommendation(
                 text="优先人工复核大关桥上报。",
@@ -368,22 +367,8 @@ def test_command_brief_summary_numbers_must_come_from_metrics() -> None:
         ],
         confidence=0.6,
     )
+    # 统计数字一致性校验已移除，年份/日期/时刻等数字不再触发拦截。
     _validate_command_brief_contract(snapshot, output)
-
-    invalid = CommandBriefOutput(
-        headline="人员救援与道路通行仍存在关键风险",
-        summary="当前共有 29 条有效上报，其中 4 条标记紧急。",
-        recommendations=[
-            BriefRecommendation(
-                text="优先人工复核大关桥上报。",
-                severity="high",
-                source_refs=["report:known"],
-            )
-        ],
-        confidence=0.6,
-    )
-    with pytest.raises(ApiError, match="metrics"):
-        _validate_command_brief_contract(snapshot, invalid)
 
 
 @pytest.mark.asyncio

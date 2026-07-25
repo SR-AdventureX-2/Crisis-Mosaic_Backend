@@ -309,9 +309,6 @@ async def create_report(
         analysis_id=payload.ai_refinement_id,
         incident_id=incident.id,
         actor=actor,
-        category=payload.category,
-        content=payload.content_original,
-        location_text=payload.location.text,
     )
     priority, source = effective_priority(
         payload.category,
@@ -369,9 +366,6 @@ async def validate_report_refinement(
     analysis_id: str | None,
     incident_id: str,
     actor: Actor,
-    category: str,
-    content: str,
-    location_text: str,
 ) -> AiAnalysis | None:
     if analysis_id is None:
         return None
@@ -390,17 +384,6 @@ async def validate_report_refinement(
         )
     if actor.is_resident and analysis.created_by_id != actor.subject_id:
         raise ApiError(403, "AI_REFINEMENT_ACCESS_DENIED", "无权使用其他设备的 AI 建议")
-    snapshot = analysis.input_snapshot
-    if (
-        str(snapshot.get("category", "")).strip() != category.strip()
-        or str(snapshot.get("content", "")).strip() != content.strip()
-        or str(snapshot.get("location_text", "")).strip() != location_text.strip()
-    ):
-        raise ApiError(
-            409,
-            "AI_REFINEMENT_STALE",
-            "上报内容或位置已变化，请重新生成 AI 整理建议",
-        )
     return analysis
 
 

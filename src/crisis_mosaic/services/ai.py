@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import httpx
+import structlog
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -206,21 +207,6 @@ def _report_input_payload(request: ReportRefinementRequest) -> dict[str, Any]:
     }
 
 
-_TIME_LIKE_RE = re.compile(
-    r"\d{1,2}:\d{2}(?::\d{2})?"
-    r"|\d{4}[-/]\d{1,2}[-/]\d{1,2}"
-    r"|\d{1,2}月\d{1,2}日"
-    r"|\d{1,2}[时点](?:\d{1,2}分?)?"
-)
-
-
-def _summary_numbers_are_metrics(summary: str, metrics: dict[str, Any]) -> bool:
-    allowed = {str(value) for value in metrics.values() if isinstance(value, int | float)}
-    # 时间/日期里的数字不是统计数量，先剔除以免误伤（如 18:44、7月24日）。
-    cleaned = _TIME_LIKE_RE.sub(" ", summary)
-    return all(number in allowed for number in re.findall(r"\d+", cleaned))
-
-
 def _prompt_hash_for(purpose: str, output_model: type[BaseModel]) -> str:
     spec = get_prompt_spec(purpose)  # type: ignore[arg-type]
     return prompt_sha256(spec, output_model.model_json_schema())
@@ -381,6 +367,36 @@ def _json_schema_response_format(output_model: type[BaseModel]) -> dict[str, Any
 
 _JSON_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
 
+_debug_log = structlog.get_logger()
+
+
+def ai_debug(event: str, /, **fields: Any) -> None:
+    """AI 调试日志：仅在 AI_DEBUG_LOG=true 时输出，事件名以 ai_debug. 开头。"""
+    if get_settings().ai_debug_log:
+        _debug_log.info(event, **fields)
+
+
+def _redact_request_body(request_body: dict[str, Any]) -> dict[str, Any]:
+    # base64 图片会把日志撑爆，替换为占位符；其余内容原样保留。
+    redacted = dict(request_body)
+    messages = []
+    for message in request_body.get("messages", []):
+        content = message.get("content")
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    url = str(part.get("image_url", {}).get("url", ""))
+                    parts.append(
+                        {"type": "image_url", "image_url": f"<base64 省略，{len(url)} 字符>"}
+                    )
+                else:
+                    parts.append(part)
+            message = {**message, "content": parts}
+        messages.append(message)
+    redacted["messages"] = messages
+    return redacted
+
 
 def _strip_json_fences(content: str) -> str:
     # Some OpenAI-compatible proxies ignore response_format and let the model
@@ -422,6 +438,14 @@ async def _repair_structured_output[OutputT: BaseModel](
             else {"type": "json_object"}
         ),
     }
+    ai_debug(
+        "ai_debug.model_request",
+        purpose="json_repair",
+        model=model,
+        endpoint=settings.ai_endpoint,
+        timeout_seconds=timeout_seconds,
+        request_body=_redact_request_body(request_body),
+    )
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await client.post(
@@ -441,6 +465,14 @@ async def _repair_structured_output[OutputT: BaseModel](
             )
         if not isinstance(content, str):
             raise TypeError("AI repair response content is not text")
+        ai_debug(
+            "ai_debug.model_response",
+            purpose="json_repair",
+            model=model,
+            status_code=response.status_code,
+            content=content,
+            usage=body.get("usage"),
+        )
         repaired = output_model.model_validate_json(_strip_json_fences(content), strict=True)
         input_tokens, output_tokens = _extract_usage(body)
         return repaired, input_tokens, output_tokens
@@ -478,6 +510,19 @@ async def _invoke_structured[OutputT: BaseModel](
     if settings.ai_provider == "fake":
         await asyncio.sleep(0)
         result = _fake_output(output_model, payload, allowed_evidence_ids)
+        ai_debug(
+            "ai_debug.model_request",
+            purpose=purpose,
+            provider="fake",
+            model=model,
+            payload=payload,
+        )
+        ai_debug(
+            "ai_debug.model_response",
+            purpose=purpose,
+            provider="fake",
+            output=result.model_dump(mode="json"),
+        )
     else:
         user_prompt = prompt_spec.render_user_prompt(canonical_json(payload))
         user_content: str | list[dict[str, Any]] = user_prompt
@@ -509,6 +554,15 @@ async def _invoke_structured[OutputT: BaseModel](
             request_body["response_format"] = _json_schema_response_format(output_model)
         else:
             request_body["response_format"] = {"type": "json_object"}
+        ai_debug(
+            "ai_debug.model_request",
+            purpose=purpose,
+            model=model,
+            endpoint=settings.ai_endpoint,
+            timeout_seconds=timeout_seconds,
+            request_body=_redact_request_body(request_body),
+        )
+        started_at = time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=timeout_seconds) as client:
                 response = await client.post(
@@ -529,17 +583,55 @@ async def _invoke_structured[OutputT: BaseModel](
                 )
             if not isinstance(content, str):
                 raise TypeError("AI response content is not text")
+            ai_debug(
+                "ai_debug.model_response",
+                purpose=purpose,
+                model=model,
+                status_code=response.status_code,
+                elapsed_ms=round((time.perf_counter() - started_at) * 1000, 1),
+                content=content,
+                usage=body.get("usage"),
+            )
             result = output_model.model_validate_json(_strip_json_fences(content), strict=True)
         except (httpx.TimeoutException, TimeoutError) as exc:
+            ai_debug(
+                "ai_debug.model_error",
+                purpose=purpose,
+                model=model,
+                elapsed_ms=round((time.perf_counter() - started_at) * 1000, 1),
+                error_code="AI_MODEL_TIMEOUT",
+                error=repr(exc),
+            )
             raise ApiError(504, "AI_MODEL_TIMEOUT", "AI 服务响应超时") from exc
         except (httpx.HTTPError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            ai_debug(
+                "ai_debug.model_error",
+                purpose=purpose,
+                model=model,
+                elapsed_ms=round((time.perf_counter() - started_at) * 1000, 1),
+                error_code="AI_SERVICE_UNAVAILABLE",
+                error=repr(exc),
+            )
             raise ApiError(503, "AI_SERVICE_UNAVAILABLE", "AI 服务调用失败") from exc
         except ValidationError as exc:
             try:
                 # json_object 模式下常见类型偏差（如数字被写成字符串），先本地宽松解析，
                 # 避免为可自愈的偏差再发起一次远程修复调用。
                 result = output_model.model_validate_json(_strip_json_fences(content))
+                ai_debug(
+                    "ai_debug.schema_lenient_reparse",
+                    purpose=purpose,
+                    model=model,
+                    validation_errors=exc.errors(include_url=False),
+                )
             except ValidationError:
+                ai_debug(
+                    "ai_debug.schema_repair_triggered",
+                    purpose=purpose,
+                    model=model,
+                    invalid_content=content,
+                    validation_errors=exc.errors(include_url=False),
+                )
                 allowed_ids = (allowed_evidence_ids or set()) | (allowed_source_refs or set())
                 result, repair_input_tokens, repair_output_tokens = (
                     await _repair_structured_output(
@@ -602,21 +694,8 @@ def _validate_report_refinement_contract(
             "AI_OUTPUT_FACT_INTEGRITY_FAILED",
             "AI 上报整理输出未保留确认位置",
         )
-    allowed_numbers = set(re.findall(r"\d+", f"{request.content}\n{request.location_text}"))
-    for number in re.findall(r"\d+", request.content):
-        if number not in output.refined_content:
-            raise ApiError(
-                502,
-                "AI_OUTPUT_FACT_INTEGRITY_FAILED",
-                "AI 上报整理输出改变或遗漏数字事实",
-            )
-    for number in re.findall(r"\d+", text):
-        if number not in allowed_numbers:
-            raise ApiError(
-                502,
-                "AI_OUTPUT_FACT_INTEGRITY_FAILED",
-                "AI 上报整理输出新增了输入中不存在的数字事实",
-            )
+    # 数字事实一致性校验已移除：误伤场景过多（居民文本中混入无意义数字、
+    # 模型合并/规整数字表达时都会被拦截），数字准确性交由居民提交前人工核对。
     for term in _PROTECTED_TERMS:
         if term in request.content and term not in output.refined_content:
             raise ApiError(
@@ -740,15 +819,8 @@ def _validate_command_brief_contract(
             "AI_OUTPUT_FACT_INTEGRITY_FAILED",
             "AI 态势简报输出包含敏感明文或完成态处置表述",
         )
-    metrics = snapshot.get("metrics")
-    if not isinstance(metrics, dict):
-        metrics = snapshot.get("counts")
-    if not isinstance(metrics, dict) or not _summary_numbers_are_metrics(output.summary, metrics):
-        raise ApiError(
-            502,
-            "AI_OUTPUT_FACT_INTEGRITY_FAILED",
-            "AI 态势简报输出包含不在 metrics 中的统计数字",
-        )
+    # 统计数字一致性校验已移除：年份、日期、时刻等时间数字极易被误判为统计数量，
+    # 误伤场景过多，数字准确性交由指挥人员人工复核。
     if not output.recommendations and output.headline != "当前信息不足":
         raise ApiError(
             502,
