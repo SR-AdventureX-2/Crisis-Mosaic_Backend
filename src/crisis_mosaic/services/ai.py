@@ -67,6 +67,24 @@ class AiInvocationResult[OutputT: BaseModel]:
     reference_valid: bool
 
 
+_HUMAN_CONFIRMATION_WARNING = "AI 只提供辅助判断，最终结论必须由指挥人员确认。"
+
+
+def _ensure_conflict_human_confirmation_warning(
+    output: ConflictAnalysisOutput,
+) -> ConflictAnalysisOutput:
+    if any(
+        "AI 只提供辅助判断" in warning and "指挥人员确认" in warning for warning in output.warnings
+    ):
+        return output
+    warnings = [*output.warnings]
+    if len(warnings) >= 30:
+        warnings[-1] = _HUMAN_CONFIRMATION_WARNING
+    else:
+        warnings.append(_HUMAN_CONFIRMATION_WARNING)
+    return output.model_copy(update={"warnings": warnings})
+
+
 _PII_PATTERNS = (
     re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"),
     re.compile(r"(?<![A-Za-z0-9])\d{17}[\dXx](?![A-Za-z0-9])"),
@@ -937,11 +955,13 @@ async def _invoke_structured[OutputT: BaseModel](
                 output_tokens = _sum_tokens(output_tokens, repair_output_tokens)
     reference_valid = True
     if isinstance(result, ConflictAnalysisOutput):
+        conflict_result = _ensure_conflict_human_confirmation_warning(result)
         try:
-            result.validate_evidence_refs(allowed_evidence_ids or set())
+            conflict_result.validate_evidence_refs(allowed_evidence_ids or set())
         except ValueError as exc:
             reference_valid = False
             raise ApiError(502, "AI_OUTPUT_REFERENCE_INVALID", str(exc)) from exc
+        result = cast(OutputT, conflict_result)
     if isinstance(result, CommandBriefOutput):
         try:
             result.validate_source_refs(allowed_source_refs or set())

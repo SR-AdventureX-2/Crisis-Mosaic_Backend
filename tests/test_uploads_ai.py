@@ -36,6 +36,7 @@ from crisis_mosaic.schemas.ai import (
 from crisis_mosaic.schemas.uploads import ImageIntentRequest
 from crisis_mosaic.security import Actor
 from crisis_mosaic.services.ai import (
+    _ensure_conflict_human_confirmation_warning,
     _media_evidence_to_attachment_output,
     _read_report_attachment_visual,
     _validate_command_brief_contract,
@@ -370,6 +371,35 @@ def test_conflict_ai_output_allows_no_recommendation_with_human_warning() -> Non
     )
 
     output.validate_evidence_refs({"evidence-1"})
+
+
+def test_conflict_ai_output_gets_server_owned_human_warning() -> None:
+    output = ConflictAnalysisOutput(
+        recommended_evidence_id="evidence-1",
+        suggested_conclusion="现有证据倾向支持道路无法通行，仍需人工复核。",
+        reasoning_summary="两条现场信息存在冲突，当前结论仅供参考。",
+        confidence=0.5,
+        evidence_assessments=[
+            EvidenceAssessment(
+                evidence_id="evidence-1",
+                authenticity_score=0.7,
+                credibility_score=0.6,
+                verdict="likely",
+                reason="来源信息完整，但尚未人工核实。",
+                extracted_facts=[],
+            )
+        ],
+        warnings=["现场状态仍可能变化。"],
+    )
+
+    normalized = _ensure_conflict_human_confirmation_warning(output)
+
+    normalized.validate_evidence_refs({"evidence-1"})
+    assert normalized.warnings == [
+        "现场状态仍可能变化。",
+        "AI 只提供辅助判断，最终结论必须由指挥人员确认。",
+    ]
+    assert output.warnings == ["现场状态仍可能变化。"]
 
 
 def test_report_refinement_rejects_unknown_or_duplicate_risk_tags() -> None:
