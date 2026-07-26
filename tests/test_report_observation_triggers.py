@@ -134,8 +134,8 @@ def _report_payload(
     content: str,
     *,
     location_text: str = "Daguan Bridge",
-    latitude: float = 30.3132,
-    longitude: float = 120.1558,
+    latitude: float | None = 30.3132,
+    longitude: float | None = 120.1558,
 ) -> dict[str, object]:
     return {
         "category": "road",
@@ -366,6 +366,146 @@ async def test_opposing_road_flood_reports_open_one_conflict(
         assert await session.scalar(select(func.count(ConflictEvidence.id))) == 2
         assert await session.scalar(select(func.count(BackgroundJob.id))) == 0
         assert await session.scalar(select(func.count(BlindSpot.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_fuzzy_address_matches_opposing_reports_without_coordinates(
+    report_api: tuple[
+        httpx.AsyncClient,
+        async_sessionmaker[AsyncSession],
+        Incident,
+        dict[str, Actor],
+    ],
+) -> None:
+    client, maker, incident, actors = report_api
+    actors["current"] = actors["first"]
+    first = await client.post(
+        f"/api/v1/incidents/{incident.id}/reports",
+        headers={
+            "X-Incident-Id": incident.id,
+            "Idempotency-Key": "fuzzy-address-passable",
+        },
+        json=_report_payload(
+            "道路可以通行",
+            location_text="浙江省杭州市余杭区礼贤路9号靠近湖畔创研中心",
+            latitude=None,
+            longitude=None,
+        ),
+    )
+    assert first.status_code == 201, first.text
+
+    actors["current"] = actors["second"]
+    second = await client.post(
+        f"/api/v1/incidents/{incident.id}/reports",
+        headers={
+            "X-Incident-Id": incident.id,
+            "Idempotency-Key": "fuzzy-address-blocked",
+        },
+        json=_report_payload(
+            "机动车无法通行",
+            location_text="杭州市余杭区礼贤路9号湖畔创研中心南门",
+            latitude=None,
+            longitude=None,
+        ),
+    )
+    assert second.status_code == 201, second.text
+
+    async with maker() as session:
+        assert await session.scalar(select(func.count(ConflictCase.id))) == 1
+        assert await session.scalar(select(func.count(ConflictEvidence.id))) == 2
+
+
+@pytest.mark.asyncio
+async def test_fuzzy_address_matches_despite_coordinate_drift(
+    report_api: tuple[
+        httpx.AsyncClient,
+        async_sessionmaker[AsyncSession],
+        Incident,
+        dict[str, Actor],
+    ],
+) -> None:
+    client, maker, incident, actors = report_api
+    actors["current"] = actors["first"]
+    first = await client.post(
+        f"/api/v1/incidents/{incident.id}/reports",
+        headers={
+            "X-Incident-Id": incident.id,
+            "Idempotency-Key": "drift-address-passable",
+        },
+        json=_report_payload(
+            "道路可以通行",
+            location_text="浙江省杭州市余杭区礼贤路9号靠近湖畔创研中心",
+            latitude=30.293205,
+            longitude=120.007637,
+        ),
+    )
+    assert first.status_code == 201, first.text
+
+    actors["current"] = actors["second"]
+    second = await client.post(
+        f"/api/v1/incidents/{incident.id}/reports",
+        headers={
+            "X-Incident-Id": incident.id,
+            "Idempotency-Key": "drift-address-blocked",
+        },
+        json=_report_payload(
+            "机动车无法通行",
+            location_text="杭州市余杭区礼贤路9号湖畔创研中心南门",
+            latitude=30.300205,
+            longitude=120.007637,
+        ),
+    )
+    assert second.status_code == 201, second.text
+
+    async with maker() as session:
+        assert await session.scalar(select(func.count(ConflictCase.id))) == 1
+        assert await session.scalar(select(func.count(ConflictEvidence.id))) == 2
+
+
+@pytest.mark.asyncio
+async def test_fuzzy_address_rejects_different_house_numbers_without_coordinates(
+    report_api: tuple[
+        httpx.AsyncClient,
+        async_sessionmaker[AsyncSession],
+        Incident,
+        dict[str, Actor],
+    ],
+) -> None:
+    client, maker, incident, actors = report_api
+    actors["current"] = actors["first"]
+    first = await client.post(
+        f"/api/v1/incidents/{incident.id}/reports",
+        headers={
+            "X-Incident-Id": incident.id,
+            "Idempotency-Key": "house-number-9-passable",
+        },
+        json=_report_payload(
+            "道路可以通行",
+            location_text="杭州市余杭区礼贤路9号湖畔创研中心",
+            latitude=None,
+            longitude=None,
+        ),
+    )
+    assert first.status_code == 201, first.text
+
+    actors["current"] = actors["second"]
+    second = await client.post(
+        f"/api/v1/incidents/{incident.id}/reports",
+        headers={
+            "X-Incident-Id": incident.id,
+            "Idempotency-Key": "house-number-19-blocked",
+        },
+        json=_report_payload(
+            "机动车无法通行",
+            location_text="杭州市余杭区礼贤路19号湖畔创研中心",
+            latitude=None,
+            longitude=None,
+        ),
+    )
+    assert second.status_code == 201, second.text
+
+    async with maker() as session:
+        assert await session.scalar(select(func.count(ConflictCase.id))) == 0
 
 
 @pytest.mark.asyncio

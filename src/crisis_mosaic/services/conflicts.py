@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import re
 from collections import Counter
 from datetime import timedelta
+from difflib import SequenceMatcher
 from typing import Any
 
 from sqlalchemy import select
@@ -37,6 +39,40 @@ from ..services.map_features import (
 from ..utils import as_utc, canonical_json, isoformat, sha256_text, utcnow
 
 _NO_TEXT_VISION_PREFIX = "[vision_policy:no_text_v1]\n"
+_ADDRESS_NOISE = re.compile(r"靠近|附近|周边|旁边|临近|位于")
+_ADDRESS_NUMBERS = re.compile(r"\d+")
+
+
+def _normalize_address(value: str) -> str:
+    without_noise = _ADDRESS_NOISE.sub("", value.casefold())
+    return "".join(character for character in without_noise if character.isalnum())
+
+
+def _addresses_likely_same(first: str, second: str) -> bool:
+    first_normalized = _normalize_address(first)
+    second_normalized = _normalize_address(second)
+    if not first_normalized or not second_normalized:
+        return False
+    if first_normalized == second_normalized:
+        return True
+
+    first_numbers = set(_ADDRESS_NUMBERS.findall(first_normalized))
+    second_numbers = set(_ADDRESS_NUMBERS.findall(second_normalized))
+    if first_numbers and second_numbers and first_numbers.isdisjoint(second_numbers):
+        return False
+
+    shorter, longer = sorted(
+        (first_normalized, second_normalized),
+        key=len,
+    )
+    if len(shorter) >= 6 and shorter in longer:
+        return True
+    return SequenceMatcher(
+        None,
+        first_normalized,
+        second_normalized,
+        autojunk=False,
+    ).ratio() >= 0.72
 
 
 def fragment_snapshot(fragment: InformationFragment) -> dict[str, Any]:
@@ -298,9 +334,10 @@ async def find_or_open_structured_conflict(
                     previous.wgs84_longitude,
                 )
                 > settings.conflict_radius_m
+                and not _addresses_likely_same(candidate.location_text, location_text)
             ):
                 continue
-        elif candidate.location_text != location_text:
+        elif not _addresses_likely_same(candidate.location_text, location_text):
             continue
         if utcnow() - as_utc(candidate.detected_at) > timedelta(
             hours=settings.conflict_window_hours
@@ -376,7 +413,7 @@ async def detect_structured_fragment_conflict(
     """Detect contradictory structured claims within the configured time/radius window."""
 
     settings = settings or get_settings()
-    fragment_location = "".join(fragment.location_text.split()).casefold()
+    fragment_location = _normalize_address(fragment.location_text)
     fragment_has_position = (
         fragment.latitude is not None
         and fragment.longitude is not None
@@ -445,9 +482,13 @@ async def detect_structured_fragment_conflict(
                     previous.wgs84_longitude,
                 )
                 > settings.conflict_radius_m
+                and not _addresses_likely_same(
+                    candidate.location_text,
+                    fragment.location_text,
+                )
             ):
                 continue
-        elif "".join(candidate.location_text.split()).casefold() != fragment_location:
+        elif not _addresses_likely_same(candidate.location_text, fragment.location_text):
             continue
         matching.append(candidate)
     if not matching:

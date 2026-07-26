@@ -173,7 +173,7 @@ class Settings(BaseSettings):
     job_poll_seconds: float = 0.5
     job_max_attempts: int = 3
     directed_min_valid_answers: int = 2
-    conflict_radius_m: float = 200.0
+    conflict_radius_m: float = 500.0
     conflict_window_hours: int = 6
     blind_spot_report_grace_minutes: int = Field(default=30, ge=0)
     location_future_tolerance_minutes: int = 5
