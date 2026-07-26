@@ -341,7 +341,7 @@ async def test_opposing_road_flood_reports_open_one_conflict(
         },
         json=_report_payload(
             "路面有很多积水",
-            location_text=location_text,
+            location_text=f"{location_text}南门",
             latitude=30.293198,
             longitude=120.007544,
         ),
@@ -469,7 +469,6 @@ async def test_explicit_road_uncertainty_opens_blind_spot_without_grace_delay(
         Incident,
         dict[str, Actor],
     ],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client, maker, incident, _ = report_api
     async with maker() as session:
@@ -489,22 +488,10 @@ async def test_explicit_road_uncertainty_opens_blind_spot_without_grace_delay(
     assert report.status_code == 201, report.text
 
     async with maker() as session:
-        job = await session.scalar(select(BackgroundJob))
-        assert job is not None
-        assert job.payload["grace_minutes"] == 0
-        assert as_utc(job.run_after) <= utcnow()
-
-    monkeypatch.setattr(workers_module, "session_factory", lambda: maker)
-    monkeypatch.setattr(workers_module, "write_lock", asyncio.Lock())
-    runtime = WorkerRuntime(Settings(blind_spot_report_grace_minutes=30))
-    job_id = await runtime._claim_job()
-    assert job_id is not None
-    await runtime._execute_job(job_id)
-
-    async with maker() as session:
         blind_spot = await session.scalar(select(BlindSpot))
         assert blind_spot is not None
         assert blind_spot.status == "open"
+        assert await session.scalar(select(func.count(BackgroundJob.id))) == 0
 
 
 @pytest.mark.asyncio
@@ -560,7 +547,8 @@ async def test_road_questions_stay_unknown_and_resident_fragment_views_remain_pr
     async with maker() as session:
         fragments = list((await session.scalars(select(InformationFragment))).all())
         assert {fragment.claim_value for fragment in fragments} == {"unknown"}
-        assert await session.scalar(select(func.count(BackgroundJob.id))) == 3
+        assert await session.scalar(select(func.count(BackgroundJob.id))) == 0
+        assert await session.scalar(select(func.count(BlindSpot.id))) == 1
         assert await session.scalar(select(func.count(ConflictCase.id))) == 0
         assert (
             await session.scalar(

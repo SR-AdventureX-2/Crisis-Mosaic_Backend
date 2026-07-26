@@ -258,13 +258,17 @@ async def find_or_open_structured_conflict(
     fragments: list[InformationFragment],
 ) -> tuple[ConflictCase, bool]:
     settings = get_settings()
+    candidate_fact_keys = {
+        item.claim_key for item in fragments if item.claim_key is not None
+    }
+    candidate_fact_keys.add(fact_key)
     cases = list(
         (
             await session.scalars(
                 select(ConflictCase)
                 .where(
                     ConflictCase.incident_id == incident_id,
-                    ConflictCase.fact_key == fact_key,
+                    ConflictCase.fact_key.in_(candidate_fact_keys),
                 )
                 .order_by(ConflictCase.created_at.desc())
             )
@@ -391,7 +395,7 @@ async def detect_structured_fragment_conflict(
                 select(InformationFragment).where(
                     InformationFragment.incident_id == fragment.incident_id,
                     InformationFragment.id != fragment.id,
-                    InformationFragment.claim_key == fragment.claim_key,
+                    InformationFragment.topic == fragment.topic,
                     InformationFragment.claim_value.is_not(None),
                     InformationFragment.claim_value != fragment.claim_value,
                     InformationFragment.status.in_(("normal", "conflict")),

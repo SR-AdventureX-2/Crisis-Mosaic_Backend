@@ -318,21 +318,24 @@ def _grace_minutes(
     *,
     fragment: InformationFragment | None = None,
 ) -> int:
-    if fragment is not None:
-        text = fragment.description
-        explicitly_uncertain = (
-            fragment.topic == "road_flooding" and _ROAD_FLOOD_UNCERTAIN.search(text)
-        ) or (
-            fragment.topic == "road_passability"
-            and _ROAD_UNCERTAIN.search(text)
-            and _ROAD_TOPIC.search(text)
-        )
-        if explicitly_uncertain:
-            return 0
+    if fragment is not None and _is_explicitly_uncertain(fragment):
+        return 0
     override = (incident.feature_flags or {}).get("blind_spot_report_grace_minutes")
     if isinstance(override, int) and not isinstance(override, bool) and override >= 0:
         return override
     return settings.blind_spot_report_grace_minutes
+
+
+def _is_explicitly_uncertain(fragment: InformationFragment) -> bool:
+    text = fragment.description
+    return bool(
+        (fragment.topic == "road_flooding" and _ROAD_FLOOD_UNCERTAIN.search(text))
+        or (
+            fragment.topic == "road_passability"
+            and _ROAD_UNCERTAIN.search(text)
+            and _ROAD_TOPIC.search(text)
+        )
+    )
 
 
 async def _ensure_blind_spot_job(
@@ -967,12 +970,23 @@ async def process_report_observation(
             fragment=fragment,
             keep_revision=fragment.revision,
         )
-        await _ensure_blind_spot_job(
-            session,
-            incident=incident,
-            fragment=fragment,
-            settings=settings,
-        )
+        if _is_explicitly_uncertain(fragment):
+            await run_report_blind_spot_detection(
+                session,
+                incident_id=incident.id,
+                fragment_id=fragment.id,
+                fragment_revision=fragment.revision,
+                due_at=fragment.received_at,
+                grace_minutes=0,
+                settings=settings,
+            )
+        else:
+            await _ensure_blind_spot_job(
+                session,
+                incident=incident,
+                fragment=fragment,
+                settings=settings,
+            )
     else:
         await _cancel_blind_spot_jobs(session, fragment=fragment)
     if not changed:
