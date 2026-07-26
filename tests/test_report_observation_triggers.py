@@ -28,12 +28,16 @@ from crisis_mosaic.models import (
     InformationFragment,
     MapFeature,
     OutboxEvent,
+    Report,
 )
 from crisis_mosaic.routers.map import router as map_router
 from crisis_mosaic.routers.questions import router as questions_router
 from crisis_mosaic.routers.reports import router as reports_router
 from crisis_mosaic.security import Actor
-from crisis_mosaic.services.report_observations import run_report_blind_spot_detection
+from crisis_mosaic.services.report_observations import (
+    extract_structured_claim,
+    run_report_blind_spot_detection,
+)
 from crisis_mosaic.utils import as_utc, utcnow
 from crisis_mosaic.workers import WorkerRuntime
 
@@ -146,6 +150,43 @@ def _report_payload(
             "provider": "manual",
         },
     }
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_topic", "expected_value"),
+    [
+        ("无积水", "road_flooding", "absent"),
+        ("没有积水", "road_flooding", "absent"),
+        ("未发现积水", "road_flooding", "absent"),
+        ("积水严重", "road_flooding", "present"),
+        ("路面有很多积水", "road_flooding", "present"),
+        ("不确定是否积水", "road_flooding", "unknown"),
+        ("没有积水，但道路无法通行", "road_passability", "blocked"),
+        ("积水很多但仍可缓慢通行", "road_passability", "passable"),
+    ],
+)
+def test_extracts_narrow_road_flooding_claims_without_inferring_passability(
+    content: str,
+    expected_topic: str,
+    expected_value: str,
+) -> None:
+    report = Report(
+        incident_id="incident",
+        reporter_device_id="resident",
+        category="road",
+        content_original=content,
+        content_display=content,
+        location_text="沿江路",
+    )
+
+    claim = extract_structured_claim(report)
+
+    assert claim is not None
+    assert claim.topic == expected_topic
+    assert claim.value == expected_value
+    assert claim.key.startswith(
+        "road.flooding:" if expected_topic == "road_flooding" else "road.passability:"
+    )
 
 
 async def _open_two_source_conflict(
@@ -265,6 +306,69 @@ async def test_resident_reports_upsert_fragments_and_open_one_conflict_idempoten
 
 
 @pytest.mark.asyncio
+async def test_opposing_road_flood_reports_open_one_conflict(
+    report_api: tuple[
+        httpx.AsyncClient,
+        async_sessionmaker[AsyncSession],
+        Incident,
+        dict[str, Actor],
+    ],
+) -> None:
+    client, maker, incident, actors = report_api
+    location_text = "浙江省杭州市余杭区礼贤路9号靠近湖畔创研中心"
+    actors["current"] = actors["first"]
+    first = await client.post(
+        f"/api/v1/incidents/{incident.id}/reports",
+        headers={
+            "X-Incident-Id": incident.id,
+            "Idempotency-Key": "road-flood-absent",
+        },
+        json=_report_payload(
+            "没有积水",
+            location_text=location_text,
+            latitude=30.293205,
+            longitude=120.007637,
+        ),
+    )
+    assert first.status_code == 201, first.text
+
+    actors["current"] = actors["second"]
+    second = await client.post(
+        f"/api/v1/incidents/{incident.id}/reports",
+        headers={
+            "X-Incident-Id": incident.id,
+            "Idempotency-Key": "road-flood-present",
+        },
+        json=_report_payload(
+            "路面有很多积水",
+            location_text=location_text,
+            latitude=30.293198,
+            longitude=120.007544,
+        ),
+    )
+    assert second.status_code == 201, second.text
+
+    async with maker() as session:
+        fragments = list(
+            (
+                await session.scalars(
+                    select(InformationFragment).order_by(InformationFragment.created_at)
+                )
+            ).all()
+        )
+        assert {fragment.topic for fragment in fragments} == {"road_flooding"}
+        assert {fragment.claim_value for fragment in fragments} == {"absent", "present"}
+        assert {fragment.status for fragment in fragments} == {"conflict"}
+        conflict_case = await session.scalar(select(ConflictCase))
+        assert conflict_case is not None
+        assert conflict_case.status == "open"
+        assert conflict_case.topic == "road_flooding"
+        assert await session.scalar(select(func.count(ConflictEvidence.id))) == 2
+        assert await session.scalar(select(func.count(BackgroundJob.id))) == 0
+        assert await session.scalar(select(func.count(BlindSpot.id))) == 0
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_resident_road_report_opens_and_later_resolves_one_blind_spot(
     report_api: tuple[
         httpx.AsyncClient,
@@ -355,6 +459,52 @@ async def test_ambiguous_resident_road_report_opens_and_later_resolves_one_blind
         assert blind_spot.resolution_value is None
         assert "resolution_fragment_id" not in (blind_spot.scope_data or {})
         assert feature is not None and feature.is_deleted is False
+
+
+@pytest.mark.asyncio
+async def test_explicit_road_uncertainty_opens_blind_spot_without_grace_delay(
+    report_api: tuple[
+        httpx.AsyncClient,
+        async_sessionmaker[AsyncSession],
+        Incident,
+        dict[str, Actor],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, maker, incident, _ = report_api
+    async with maker() as session:
+        stored_incident = await session.get(Incident, incident.id)
+        assert stored_incident is not None
+        stored_incident.feature_flags = {}
+        await session.commit()
+
+    report = await client.post(
+        f"/api/v1/incidents/{incident.id}/reports",
+        headers={
+            "X-Incident-Id": incident.id,
+            "Idempotency-Key": "explicit-road-uncertainty",
+        },
+        json=_report_payload("不知道路面能不能通行"),
+    )
+    assert report.status_code == 201, report.text
+
+    async with maker() as session:
+        job = await session.scalar(select(BackgroundJob))
+        assert job is not None
+        assert job.payload["grace_minutes"] == 0
+        assert as_utc(job.run_after) <= utcnow()
+
+    monkeypatch.setattr(workers_module, "session_factory", lambda: maker)
+    monkeypatch.setattr(workers_module, "write_lock", asyncio.Lock())
+    runtime = WorkerRuntime(Settings(blind_spot_report_grace_minutes=30))
+    job_id = await runtime._claim_job()
+    assert job_id is not None
+    await runtime._execute_job(job_id)
+
+    async with maker() as session:
+        blind_spot = await session.scalar(select(BlindSpot))
+        assert blind_spot is not None
+        assert blind_spot.status == "open"
 
 
 @pytest.mark.asyncio

@@ -37,6 +37,7 @@ from ..schemas.ai import (
     CommandBriefOutput,
     CommandBriefRequest,
     ConflictAnalysisOutput,
+    EvidenceAssessment,
     MediaEvidenceExtractionOutput,
     ReportRefinementOutput,
     ReportRefinementRequest,
@@ -68,6 +69,9 @@ class AiInvocationResult[OutputT: BaseModel]:
 
 
 _HUMAN_CONFIRMATION_WARNING = "AI 只提供辅助判断，最终结论必须由指挥人员确认。"
+_INVALID_REFERENCE_WARNING = (
+    "AI 返回的证据引用与当前证据清单不一致，本次结果已按保守策略降级。"
+)
 
 
 def _ensure_conflict_human_confirmation_warning(
@@ -83,6 +87,56 @@ def _ensure_conflict_human_confirmation_warning(
     else:
         warnings.append(_HUMAN_CONFIRMATION_WARNING)
     return output.model_copy(update={"warnings": warnings})
+
+
+def _conflict_reference_fallback(
+    output: ConflictAnalysisOutput,
+    *,
+    payload: dict[str, Any],
+    allowed_evidence_ids: set[str],
+) -> ConflictAnalysisOutput:
+    ordered_evidence_ids: list[str] = []
+    for item in payload.get("evidence", []):
+        if not isinstance(item, dict):
+            continue
+        evidence_id = item.get("id")
+        if (
+            isinstance(evidence_id, str)
+            and evidence_id in allowed_evidence_ids
+            and evidence_id not in ordered_evidence_ids
+        ):
+            ordered_evidence_ids.append(evidence_id)
+    if set(ordered_evidence_ids) != allowed_evidence_ids:
+        raise ApiError(
+            500,
+            "AI_CONTEXT_INVALID",
+            "AI 冲突上下文与允许证据清单不一致",
+        )
+    assessments = [
+        EvidenceAssessment(
+            evidence_id=evidence_id,
+            authenticity_score=0.5,
+            credibility_score=0.0,
+            verdict="uncertain",
+            reason="AI 返回的证据引用无效，未采纳自动评估，需人工复核。",
+            extracted_facts=[],
+        )
+        for evidence_id in ordered_evidence_ids
+    ]
+    return ConflictAnalysisOutput(
+        recommended_evidence_id="",
+        suggested_conclusion="现有证据不足，无法形成可靠结论，建议人工复核。",
+        reasoning_summary=(
+            "AI 返回的证据引用与当前冲突证据清单不一致，"
+            "服务端已拒绝引用并按全部当前证据回退为待人工复核。"
+        ),
+        confidence=min(output.confidence, 0.2),
+        evidence_assessments=assessments,
+        warnings=[
+            _INVALID_REFERENCE_WARNING,
+            _HUMAN_CONFIRMATION_WARNING,
+        ],
+    )
 
 
 _PII_PATTERNS = (
@@ -960,7 +1014,23 @@ async def _invoke_structured[OutputT: BaseModel](
             conflict_result.validate_evidence_refs(allowed_evidence_ids or set())
         except ValueError as exc:
             reference_valid = False
-            raise ApiError(502, "AI_OUTPUT_REFERENCE_INVALID", str(exc)) from exc
+            ai_debug(
+                "ai_debug.reference_fallback_triggered",
+                purpose=purpose,
+                validation_error=str(exc),
+                allowed_evidence_ids=list(
+                    item.get("id")
+                    for item in payload.get("evidence", [])
+                    if isinstance(item, dict)
+                    and item.get("id") in (allowed_evidence_ids or set())
+                ),
+            )
+            conflict_result = _conflict_reference_fallback(
+                conflict_result,
+                payload=payload,
+                allowed_evidence_ids=allowed_evidence_ids or set(),
+            )
+            conflict_result.validate_evidence_refs(allowed_evidence_ids or set())
         result = cast(OutputT, conflict_result)
     if isinstance(result, CommandBriefOutput):
         try:

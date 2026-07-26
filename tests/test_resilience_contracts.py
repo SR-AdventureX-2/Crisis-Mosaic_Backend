@@ -14,7 +14,11 @@ from crisis_mosaic.config import Settings, get_settings
 from crisis_mosaic.errors import ApiError
 from crisis_mosaic.main import create_app
 from crisis_mosaic.middleware import redact
-from crisis_mosaic.schemas.ai import ConflictProcessingOptions, ReportRefinementOutput
+from crisis_mosaic.schemas.ai import (
+    ConflictAnalysisOutput,
+    ConflictProcessingOptions,
+    ReportRefinementOutput,
+)
 from crisis_mosaic.services.ai import _invoke_structured
 from crisis_mosaic.services.ai_prompts import REPORT_REFINEMENT_PROMPT_VERSION, get_prompt_spec
 from crisis_mosaic.services.uploads import _sanitize_image
@@ -149,6 +153,74 @@ async def test_openai_compatible_uses_versioned_prompt_schema_and_records_usage(
     assert result.output_tokens == 45
     assert result.schema_valid is True
     assert result.output.confidence == 0.7
+
+
+@pytest.mark.asyncio
+async def test_conflict_unknown_evidence_reference_returns_conservative_result() -> None:
+    settings = _openai_settings()
+    evidence_ids = ["evidence-later", "evidence-earlier"]
+    payload = {
+        "conflict": {
+            "id": "conflict-1",
+            "revision": 1,
+            "title": "道路通行冲突",
+            "topic": "road_passability",
+            "location_text": "沿江路",
+            "status": "open",
+        },
+        "evidence": [{"id": evidence_id} for evidence_id in evidence_ids],
+    }
+    invalid_output = {
+        "recommended_evidence_id": "evidence-hallucinated",
+        "suggested_conclusion": "道路无法通行。",
+        "reasoning_summary": "模型返回了错误的证据引用。",
+        "confidence": 0.9,
+        "evidence_assessments": [
+            {
+                "evidence_id": "evidence-hallucinated",
+                "authenticity_score": 0.9,
+                "credibility_score": 0.9,
+                "verdict": "supported",
+                "reason": "错误引用。",
+                "extracted_facts": ["道路无法通行"],
+            }
+        ],
+        "warnings": ["AI 只提供辅助判断，最终结论必须由指挥人员确认。"],
+    }
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.post(settings.ai_endpoint).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": json.dumps(invalid_output)}}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 40},
+                },
+            )
+        )
+
+        result = await _invoke_structured(
+            purpose="conflict_analysis",
+            payload=payload,
+            output_model=ConflictAnalysisOutput,
+            model="test-model",
+            timeout_seconds=1,
+            settings=settings,
+            allowed_evidence_ids=set(evidence_ids),
+        )
+
+    assert len(route.calls) == 1
+    assert result.reference_valid is False
+    assert result.output.recommended_evidence_id == ""
+    assert result.output.confidence == 0.2
+    assert [
+        item.evidence_id for item in result.output.evidence_assessments
+    ] == evidence_ids
+    assert all(
+        item.verdict == "uncertain"
+        and item.credibility_score == 0
+        and not item.extracted_facts
+        for item in result.output.evidence_assessments
+    )
 
 
 @pytest.mark.asyncio

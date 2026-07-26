@@ -58,6 +58,20 @@ _ROAD_RISK = re.compile(
     r"|\b(?:flood(?:ed|ing)?|landslide|road damage|bridge damage)\b",
     re.IGNORECASE,
 )
+_ROAD_FLOOD_ABSENT = re.compile(
+    r"(?:\u6ca1\u6709|\u65e0|\u672a\u89c1|\u672a\u53d1\u73b0|\u5e76\u672a|\u5c1a\u672a|"
+    r"\u4e0d\u5b58\u5728|\u5e76\u65e0).{0,4}\u79ef\u6c34"
+    r"|\u79ef\u6c34.{0,6}(?:\u5df2\u9000|\u6d88\u9000|\u9000\u53bb|\u5df2\u6392\u9664)",
+    re.IGNORECASE,
+)
+_ROAD_FLOOD_UNCERTAIN = re.compile(
+    r"(?:\u662f\u5426|\u6709\u65e0|\u6709\u6ca1\u6709|\u4e0d\u786e\u5b9a|"
+    r"\u4e0d\u77e5\u9053|\u672a\u77e5|\u5f85\u786e\u8ba4).{0,10}\u79ef\u6c34"
+    r"|\u79ef\u6c34.{0,10}(?:\u662f\u5426|\u6709\u65e0|\u4e0d\u786e\u5b9a|"
+    r"\u4e0d\u77e5\u9053|\u672a\u77e5|\u5f85\u786e\u8ba4|\u60c5\u51b5\u4e0d\u660e)",
+    re.IGNORECASE,
+)
+_ROAD_FLOOD_PRESENT = re.compile(r"\u79ef\u6c34", re.IGNORECASE)
 _ROAD_UNCERTAIN = re.compile(
     r"\u662f\u5426|\u80fd\u5426|\u80fd\u4e0d\u80fd|\u4e0d\u786e\u5b9a|\u4e0d\u77e5\u9053|\u672a\u77e5|\u5f85\u786e\u8ba4"
     r"|[\u5417\uff1f?]|\b(?:unknown|unclear|uncertain|not sure|whether)\b",
@@ -91,6 +105,12 @@ def extract_structured_claim(report: Report) -> StructuredClaim | None:
     if report.category != "road":
         return None
     text = f"{report.content_original}\n{report.content_display}"
+    if _ROAD_FLOOD_UNCERTAIN.search(text):
+        return StructuredClaim(
+            topic="road_flooding",
+            key=_road_flooding_fact_key(report.location_text),
+            value="unknown",
+        )
     if _ROAD_UNCERTAIN.search(text) and _ROAD_TOPIC.search(text):
         return StructuredClaim(
             topic="road_passability",
@@ -104,6 +124,22 @@ def extract_structured_claim(report: Report) -> StructuredClaim | None:
             topic="road_passability",
             key=_road_fact_key(report.location_text),
             value="blocked" if blocked else "passable",
+        )
+    flood_absent = bool(_ROAD_FLOOD_ABSENT.search(text))
+    flood_present = bool(
+        _ROAD_FLOOD_PRESENT.search(_ROAD_FLOOD_ABSENT.sub("", text))
+    )
+    if flood_absent != flood_present:
+        return StructuredClaim(
+            topic="road_flooding",
+            key=_road_flooding_fact_key(report.location_text),
+            value="absent" if flood_absent else "present",
+        )
+    if flood_absent or flood_present:
+        return StructuredClaim(
+            topic="road_flooding",
+            key=_road_flooding_fact_key(report.location_text),
+            value="unknown",
         )
     if blocked or passable or _ROAD_RISK.search(text):
         return StructuredClaim(
@@ -121,6 +157,11 @@ def _normalized_location(value: str) -> str:
 def _road_fact_key(location_text: str) -> str:
     location_hash = hashlib.sha256(_normalized_location(location_text).encode()).hexdigest()[:20]
     return f"road.passability:{location_hash}"
+
+
+def _road_flooding_fact_key(location_text: str) -> str:
+    location_hash = hashlib.sha256(_normalized_location(location_text).encode()).hexdigest()[:20]
+    return f"road.flooding:{location_hash}"
 
 
 def _same_location(
@@ -271,7 +312,23 @@ async def _upsert_report_fragment(
     return fragment, False, True
 
 
-def _grace_minutes(incident: Incident, settings: Settings) -> int:
+def _grace_minutes(
+    incident: Incident,
+    settings: Settings,
+    *,
+    fragment: InformationFragment | None = None,
+) -> int:
+    if fragment is not None:
+        text = fragment.description
+        explicitly_uncertain = (
+            fragment.topic == "road_flooding" and _ROAD_FLOOD_UNCERTAIN.search(text)
+        ) or (
+            fragment.topic == "road_passability"
+            and _ROAD_UNCERTAIN.search(text)
+            and _ROAD_TOPIC.search(text)
+        )
+        if explicitly_uncertain:
+            return 0
     override = (incident.feature_flags or {}).get("blind_spot_report_grace_minutes")
     if isinstance(override, int) and not isinstance(override, bool) and override >= 0:
         return override
@@ -299,7 +356,7 @@ async def _ensure_blind_spot_job(
     )
     if any(job.payload.get("fragment_revision") == fragment.revision for job in jobs):
         return
-    grace_minutes = _grace_minutes(incident, settings)
+    grace_minutes = _grace_minutes(incident, settings, fragment=fragment)
     due_at = as_utc(fragment.received_at) + timedelta(minutes=grace_minutes)
     session.add(
         BackgroundJob(
@@ -1111,7 +1168,7 @@ async def run_report_blind_spot_detection(
     effective_grace_minutes = (
         grace_minutes
         if grace_minutes is not None
-        else _grace_minutes(incident, settings)
+        else _grace_minutes(incident, settings, fragment=fragment)
     )
     effective_due_at = (
         as_utc(due_at)

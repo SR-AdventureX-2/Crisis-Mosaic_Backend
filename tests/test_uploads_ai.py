@@ -36,6 +36,7 @@ from crisis_mosaic.schemas.ai import (
 from crisis_mosaic.schemas.uploads import ImageIntentRequest
 from crisis_mosaic.security import Actor
 from crisis_mosaic.services.ai import (
+    _conflict_reference_fallback,
     _ensure_conflict_human_confirmation_warning,
     _media_evidence_to_attachment_output,
     _read_report_attachment_visual,
@@ -400,6 +401,52 @@ def test_conflict_ai_output_gets_server_owned_human_warning() -> None:
         "AI 只提供辅助判断，最终结论必须由指挥人员确认。",
     ]
     assert output.warnings == ["现场状态仍可能变化。"]
+
+
+def test_conflict_ai_invalid_reference_falls_back_without_rebinding() -> None:
+    real_ids = [
+        "019f9539-95cf-7dc8-b6e8-2d6abff9ae9d",
+        "019f9539-95d3-7b21-a405-920685af8932",
+    ]
+    output = ConflictAnalysisOutput(
+        recommended_evidence_id="019f9539-95d3-7dc8-b6e8-2d6abff9ae9d",
+        suggested_conclusion="道路无法通行。",
+        reasoning_summary="模型错误地拼接了证据 ID。",
+        confidence=0.9,
+        evidence_assessments=[
+            EvidenceAssessment(
+                evidence_id=real_ids[0],
+                authenticity_score=0.8,
+                credibility_score=0.8,
+                verdict="supported",
+                reason="第一条证据。",
+                extracted_facts=["小型车辆可缓慢通行"],
+            ),
+            EvidenceAssessment(
+                evidence_id="019f9539-95d3-7dc8-b6e8-2d6abff9ae9d",
+                authenticity_score=0.8,
+                credibility_score=0.8,
+                verdict="supported",
+                reason="错误引用。",
+                extracted_facts=["机动车无法通行"],
+            ),
+        ],
+        warnings=[],
+    )
+
+    fallback = _conflict_reference_fallback(
+        output,
+        payload={"evidence": [{"id": evidence_id} for evidence_id in real_ids]},
+        allowed_evidence_ids=set(real_ids),
+    )
+
+    fallback.validate_evidence_refs(set(real_ids))
+    assert fallback.recommended_evidence_id == ""
+    assert fallback.confidence == 0.2
+    assert [item.evidence_id for item in fallback.evidence_assessments] == real_ids
+    assert all(item.verdict == "uncertain" for item in fallback.evidence_assessments)
+    assert all(not item.extracted_facts for item in fallback.evidence_assessments)
+    assert "019f9539-95d3-7dc8-b6e8-2d6abff9ae9d" not in fallback.model_dump_json()
 
 
 def test_report_refinement_rejects_unknown_or_duplicate_risk_tags() -> None:
