@@ -1,4 +1,6 @@
 # Crisis Mosaic Backend
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FSR-AdventureX-2%2FCrisis-Mosaic_Backend.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2FSR-AdventureX-2%2FCrisis-Mosaic_Backend?ref=badge_shield)
+
 
 Crisis Mosaic 的 FastAPI 单机功能型 P0 后端。它实现匿名居民上报、实名联络密文快照、
 事件地图、图片/视频媒体意图、定向问答、冲突与事实版本链、AI 辅助分析、审计、
@@ -255,3 +257,6 @@ AI、Kodo Mock 和 Push Mock，并使用测试凭证验证真实 Kodo Token 的�
 ## License
 
 本项目采用 [MIT License](LICENSE)。
+
+
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FSR-AdventureX-2%2FCrisis-Mosaic_Backend.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2FSR-AdventureX-2%2FCrisis-Mosaic_Backend?ref=badge_large)
